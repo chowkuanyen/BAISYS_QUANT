@@ -352,7 +352,7 @@ class StockAnalyzer:
                     symbol=format_stock_code(code),
                     start_date=start_date_str,
                     end_date=end_date_str,
-                    adjust="hfq"
+                    adjust="qfq"
                 )
                 if hist_df is not None and not hist_df.empty:
                     # 标准化列名
@@ -907,7 +907,7 @@ class StockAnalyzer:
                 return
 
             # 历史数据获取和技术指标计算
-            hist_df_all = self._fetch_hist_data_parallel(filtered_codes_list, days=90)
+            hist_df_all = self._fetch_hist_data_parallel(filtered_codes_list, days=365)
             signal_processor = TASignalProcessor(self)
             ta_signals = signal_processor.process_signals (filtered_codes_list, hist_df_all,spot_df)
             self._save_ta_signals_to_txt(ta_signals)
@@ -1085,3 +1085,4 @@ class StockAnalyzer:
 if __name__ == "__main__":
     analyzer = StockAnalyzer()
     analyzer.run()
+
