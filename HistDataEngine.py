@@ -7,7 +7,6 @@ import datetime
 import time
 from sqlalchemy import create_engine, text
 # 如果未安装 psycopg2，可能需要安装: pip install psycopg2-binary
-# from sqlalchemy.exc import SQLAlchemyError # 如果想更具体地捕获 SQLAlchemy 的异常
 import tushare as ts
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
@@ -22,33 +21,33 @@ class StockSyncEngine:
     def __init__(self, db_url=DB_URL, base_data_dir=None):
         self.token = "f4422b90a91c02d7dc68dd24f066988064d7307790f200243822cac3"  # 更新为你的 Tushare Token
 
-        print(
-            f"[DEBUG] HistDataEngine: StockSyncEngine __init__ started. Before create_engine. self.db is not yet set.")
-        self.db = None  # 明确初始化 self.db 为 None
-        # --- 添加数据库引擎创建的错误处理 ---
-        try:
-            temp_db_engine = create_engine(db_url)
-            self.db = temp_db_engine  # 仅在成功创建后才赋值给 self.db
-            # 成功创建引擎后打印调试信息
-            print(f"[DEBUG] HistDataEngine: Database engine created and assigned to self.db successfully: {self.db}")
-        except Exception as e:  # 捕获所有可能的异常
-            print(
-                f"[CRITICAL] HistDataEngine: StockSyncEngine initialization failed: Could not create database engine with URL '{db_url}'. Error: {e}")
-            # self.db 已经明确初始化为 None，这里不需要再次设置
-            # 重新抛出异常，让上层调用者（StockAnalyzer）知道这里出了问题，
-            # 而不是在后面访问不存在的属性时才报错。
-            raise RuntimeError(f"Database engine creation failed in StockSyncEngine: {e}") from e
-        # --- 错误处理结束 ---
+        # ✅ 修复：初始化数据库引擎！这是你缺失的关键一步！
+        self.db = create_engine(
+            db_url,
+            pool_pre_ping=True,      # 自动检测连接是否存活
+            pool_recycle=3600,       # 每小时回收连接
+            echo=False               # 生产环境设为 False
+        )
 
-        print(
-            f"[DEBUG] HistDataEngine: StockSyncEngine __init__ finished. Final state of self.db: {self.db}. Is hasattr(self, 'db')? {hasattr(self, 'db')}")
+        # ✅ 测试连接（可选但强烈推荐）
+        try:
+            with self.db.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            print("[INFO] ✅ 数据库引擎初始化成功，连接测试通过。")
+        except Exception as e:
+            print(f"[CRITICAL] ❌ 数据库连接失败！请检查：\n"
+                  f"  - URL: {db_url}\n"
+                  f"  - PostgreSQL 是否运行？\n"
+                  f"  - 数据库 'Corenews' 是否存在？\n"
+                  f"  - 用户名/密码是否正确？\n"
+                  f"  - 是否安装了 psycopg2-binary？pip install psycopg2-binary\n"
+                  f"  - 错误详情: {type(e).__name__}: {e}")
+            raise RuntimeError("数据库引擎初始化失败，程序无法继续。") from e
 
         self.global_start = "20250101"  # 通常需要一个过去的日期来获取历史数据
         self.today = datetime.datetime.now().strftime("%Y%m%d")
         self.today_dt = pd.to_datetime(self.today).normalize()
 
-        # base_data_dir 应该是 Corenews_Main 中 Config.TEMP_DATA_DIRECTORY 的路径
-        # 确保这个路径存在，或者由 Config 类在初始化时创建
         self.base_data_dir = base_data_dir if base_data_dir else os.path.join(os.path.expanduser('~'), 'Downloads',
                                                                               'CoreNews_Reports', 'ShareData')
         os.makedirs(self.base_data_dir, exist_ok=True)  # 确保该目录存在
@@ -63,8 +62,7 @@ class StockSyncEngine:
         返回包含标准化纯数字股票代码和股票简称、行业等核心信息的 DataFrame。
         """
         try:
-            # 假设 Ts_GetStockBasicinfo.py 在同一目录下，或者在 Python 路径中
-            from Ts_GetStockBasicinfo import TushareStockManager
+             from Ts_GetStockBasicinfo import TushareStockManager
         except ImportError:
             print("[ERROR] 无法导入 Ts_GetStockBasicinfo 模块，请检查文件路径和类名。")
             return pd.DataFrame(columns=['ts_code', 'name', 'industry', '股票代码'])
@@ -84,14 +82,14 @@ class StockSyncEngine:
                 stock_index_df = manager.get_basic_data(list_status='L', market='主板', save_path=dict_file_path)
                 print(f"[INFO] 股票字典保存至：{dict_file_path}")
 
-                # --- 确保通过 Tushare 获取的数据也标准化列名 ---
+
                 if 'name' not in stock_index_df.columns and '股票简称' in stock_index_df.columns:
                     stock_index_df.rename(columns={'股票简称': 'name'}, inplace=True)
                 if 'industry' not in stock_index_df.columns and '行业' in stock_index_df.columns:
                     stock_index_df.rename(columns={'行业': 'industry'}, inplace=True)
                 if 'ts_code' not in stock_index_df.columns and 'symbol' in stock_index_df.columns:
                     stock_index_df.rename(columns={'symbol': 'ts_code'}, inplace=True)
-                # --- 确保通过 Tushare 获取的数据也标准化列名结束 ---
+
 
             except Exception as e:
                 print(f"[ERROR] Tushare接口获取主板股票数据失败: {e}")
@@ -107,7 +105,7 @@ class StockSyncEngine:
                            'market': str, '股票代码': str}  # 添加 '股票代码' 到 dtype
                 )
 
-                # --- 列名标准化处理开始 ---
+
                 if 'ts_code' not in stock_index_df.columns:
                     if 'symbol' in stock_index_df.columns:
                         stock_index_df.rename(columns={'symbol': 'ts_code'}, inplace=True)
@@ -259,10 +257,8 @@ class StockSyncEngine:
             print("[WARNING] 未能获取到主力研报盈利预测数据。研报过滤池将为空。")
             return set()
 
-        # >>> 添加调试打印：研报数据处理前的列名
         original_cols_debug = report_df.columns.tolist()
-        # 清理列名中的首尾空格（这行已经在 _standardize_report_columns 中处理，这里保留调试用）
-        # report_df.columns = [col.strip() for col in report_df.columns]
+
         cleaned_cols_debug = report_df.columns.tolist()  # 获取标准化后的列名
         if original_cols_debug != cleaned_cols_debug:
             print(f"  - (DEBUG) 主力研报数据列名已清理，原: {original_cols_debug}，清理后: {cleaned_cols_debug}")
@@ -282,7 +278,7 @@ class StockSyncEngine:
         report_df[report_col] = pd.to_numeric(report_df[report_col], errors='coerce').fillna(0)
 
         # 过滤条件：研报数 > 2
-        filtered_reports = report_df[report_df[report_col] > 2].copy()
+        filtered_reports = report_df[report_df[report_col] > 1].copy()
 
         if filtered_reports.empty:
             print("[INFO] 过滤后没有股票的研报数 > 2。研报过滤池将为空。")
@@ -423,18 +419,11 @@ class StockSyncEngine:
             print("[CRITICAL] 研报过滤后无有效股票代码（研报筛选结果为空），无法进行K线数据同步，程序退出。")
             return
 
-        print(f"[INFO] 从主力研报筛选获得 {len(report_qualified_pure_codes_set)} 只股票的纯数字代码。")
-        # >>> 添加调试打印：研报股票代码样本
-        print(
-            f"[DEBUG] Report qualified pure codes sample ({len(report_qualified_pure_codes_set)} items): {list(report_qualified_pure_codes_set)[:10]}")
 
         # Step 3: 进行股票列表的交集运算 (在 Tushare 股票池中，且研报数 > 2)
-        # 修正：将 'tushure_pure_codes' 改为 'tushare_pure_codes' (这个错误在之前的版本中就已修正)
         final_stock_universe_pure_codes = list(tushare_pure_codes.intersection(report_qualified_pure_codes_set))
 
-        # >>> 添加调试打印：交集结果
-        print(f"[DEBUG] Intersection size: {len(final_stock_universe_pure_codes)}")
-        print(f"[DEBUG] Intersection sample: {final_stock_universe_pure_codes[:10]}")
+
 
         if not final_stock_universe_pure_codes:
             print("[CRITICAL] 没有股票同时满足 Tushare 基础股票池和研报过滤条件，无法进行K线数据同步，程序退出。")
@@ -464,11 +453,11 @@ class StockSyncEngine:
             print("[CRITICAL] 最终过滤后的股票代码无法转换为有效的 Akshare 格式，无法进行K线数据同步，程序退出。")
             return
 
-        print(f"[INFO] 准备下载 {len(symbols_to_fetch_prefixed)} 只股票的K线数据。")
-        print(f"[INFO] 开始执行数据同步，采用 '先清空 stock_daily_kline 表，再全量下载并写入' 模式。")
+        print(f"[INFO] 准备下载 {len(symbols_to_fetch_prefixed)} 只股票的K线数据 先清空 stock_daily_kline 表，再全量下载并写入。")
 
-        # Step 5: 清空 stock_daily_kline 表
-        self._clear_stock_daily_kline_table()  # 内部已包含 self.db is None 检查
+
+
+        self._clear_stock_daily_kline_table()
 
         # Step 6: 并行下载过滤后的股票的历史数据
         MAX_WORKERS = 10
