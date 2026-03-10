@@ -1,5 +1,3 @@
-# Corenews_Main.py
-
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,7 +7,7 @@ from typing import Callable, Dict, Any, List
 import akshare as ak
 import pandas as pd
 import pandas_ta as ta  # 勿删
-from sqlalchemy import text  # 仅保留 text，create_engine 已移除
+from sqlalchemy import text
 import Distribution as dist
 import Industrytrending as industry
 from DataManager import DatabaseWriter
@@ -66,7 +64,7 @@ class StockAnalyzer:
         self.executor = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
         self.start_time = time.time()
 
-        # ✅ 初始化日志管理器（单例）
+        
         self.logger = LoggerManager(
             log_dir=os.path.join(self.config.SAVE_DIRECTORY, "Logs"),
             log_filename=f"Corenews_Main_{self.today_str}.log",
