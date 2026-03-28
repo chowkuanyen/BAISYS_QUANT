@@ -3,24 +3,39 @@ import akshare as ak
 import pandas as pd
 import datetime
 import time
+import urllib3.util
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 import tushare as ts
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from typing import List, Set, Optional
 from FormatManager.ShareCodeFormatMgr import format_stock_code
+from ConfigParser import Config
 
 class StockSyncEngine:
-    DB_URL = "postgresql+psycopg2://postgres:****@10.22.**.**:5432/Corenews"
     AKSHARE_RETRIES = 3
     AKSHARE_DELAY = 5
 
-    def __init__(self, db_url=DB_URL, base_data_dir=None):
-        self.token = "***"  # 请替换为你的真实 Token
+    def __init__(self, config_file: str = "config.ini"):
+
+        self.config_file = config_file
+        self.config = Config(config_file=config_file)
+        self.token = self.config.TUSHARE_TOKEN
+
+        url_object = URL.create(
+            "postgresql+psycopg2",
+            username=self.config.DB_USER,
+            password=self.config.DB_PASSWORD,
+            host=self.config.DB_HOST,
+            port=self.config.DB_PORT,
+            database=self.config.DB_NAME
+        )
+
 
         #  初始化数据库引擎
         self.db = create_engine(
-            db_url,
+            url_object,
             pool_pre_ping=True,
             pool_recycle=3600,
             echo=False
@@ -32,22 +47,15 @@ class StockSyncEngine:
                 conn.execute(text("SELECT 1"))
             print("[INFO]  数据库引擎初始化成功，连接测试通过。")
         except Exception as e:
-            print(f"[CRITICAL] ❌ 数据库连接失败！请检查：\n"
-                  f"  - URL: {db_url}\n"
-                  f"  - PostgreSQL 是否运行？\n"
-                  f"  - 数据库 'Corenews' 是否存在？\n"
-                  f"  - 用户名/密码是否正确？\n"
-                  f"  - 是否安装了 psycopg2-binary？pip install psycopg2-binary\n"
-                  f"  - 错误详情: {type(e).__name__}: {e}")
+            print(f"  - 错误详情: {type(e).__name__}: {e}")
             raise RuntimeError("数据库引擎初始化失败，程序无法继续。") from e
 
         self.global_start = "20250301"
         self.today = datetime.datetime.now().strftime("%Y%m%d")
         self.today_dt = pd.to_datetime(self.today).normalize()
 
-        self.base_data_dir = base_data_dir if base_data_dir else os.path.join(
-            os.path.expanduser('~'), 'Downloads', 'CoreNews_Reports', 'ShareData'
-        )
+        # 修复路径初始化问题：使用配置中的临时目录而不是URL对象
+        self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
 
         # 缓存文件路径（已处理，带完整数据）
@@ -205,7 +213,7 @@ class StockSyncEngine:
 
     def _get_research_report_filtered_symbols(self) -> Set[str]:
         """
-        获取研报“机构投资评级(近六个月)-买入” > 1 的股票代码集合。
+        获取研报"机构投资评级(近六个月)-买入" > 1 的股票代码集合。
         返回纯数字代码（如 '000001'）。
         """
         print("\n>>> 正在获取主力研报盈利预测并进行过滤...")
@@ -316,7 +324,6 @@ class StockSyncEngine:
 
     def run_engine(self):
         """主运行函数：研报过滤 + K线数据同步"""
-        print(f"[INFO] HistDataEngine 启动运行。")
         print(f"[DEBUG] 起始日期: {self.global_start}, 今日: {self.today}")
 
         if self.db is None:
@@ -362,6 +369,7 @@ class StockSyncEngine:
                     df['symbol'] = df['symbol'].astype(str)
                     print(f"  - ✅ 成功加载缓存，共 {len(df)} 条记录。")
 
+
                     try:
                         df.to_sql(
                             name='stock_daily_kline',
@@ -376,6 +384,7 @@ class StockSyncEngine:
                         print(f"[ERROR] 写入数据库失败: {e}")
                         raise
 
+
                     final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
                     try:
                         with open(final_output_path, 'w', encoding='utf-8') as f:
@@ -385,22 +394,18 @@ class StockSyncEngine:
                     except Exception as e:
                         print(f"[ERROR] 保存最终代码列表失败: {e}")
 
-                    print("\n" + "=" * 60)
-                    print("🟢 HistDataEngine 运行完成（缓存复用）！")
                     print(f"  - 今日日期: {self.today}")
                     print(f"  - 筛选股票数: {len(final_codes)}")
                     print(f"  - 写入数据库条数: {len(df)}")
-                    print("=" * 60)
 
-                    return  # ✅ 结束流程，跳过网络请求
+                    return
 
             except Exception as e:
                 print(f"[WARN] 缓存加载失败: {e}")
 
 
-        #  Step 5: 过滤符合研报条件的代码（>1）
 
-        filtered_codes = final_codes  # ←  这才是真正的“最终要处理的股票”
+        filtered_codes = final_codes  # ←  这才是真正的"最终要处理的股票"
         print(f"[INFO]  将获取 {len(filtered_codes)} 只股票的 K 线（基于交集结果）。")
 
         #  Step 6: 获取最终 Akshare 格式代码
@@ -464,14 +469,11 @@ class StockSyncEngine:
             print(f"[ERROR] 写入数据库失败: {e}")
             raise
 
-        #  Step 10: 输出最终结果统计
-        print("\n" + "="*60)
-        print("🟢 HistDataEngine 运行完成！")
         print(f"  - 今日日期: {self.today}")
         print(f"  - 筛选股票数: {len(filtered_codes)}")
         print(f"  - 成功获取 K 线股票: {len(kline_dfs)}")
         print(f"  - 写入数据库条数: {len(combined_kline_df)}")
-        print("="*60)
+
 
         #  可选：保存最终过滤列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
@@ -482,22 +484,3 @@ class StockSyncEngine:
             print(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
         except Exception as e:
             print(f"[ERROR] 保存最终代码列表失败: {e}")
-
-    def get_latest_kline(self, symbol: str = None) -> Optional[pd.DataFrame]:
-        """获取最近1条K线（用于调试）"""
-        if self.db is None:
-            return None
-        try:
-            query = text("""
-                SELECT * FROM stock_daily_kline
-                WHERE symbol = :symbol
-                ORDER BY trade_date DESC
-                LIMIT 1
-            """)
-            with self.db.connect() as conn:
-                result = conn.execute(query, {"symbol": symbol})
-                df = pd.DataFrame(result.fetchall(), columns=result.keys())
-                return df
-        except Exception as e:
-            print(f"[ERROR] 获取近期K线失败: {e}")
-            return None
