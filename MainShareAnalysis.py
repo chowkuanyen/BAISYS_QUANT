@@ -109,13 +109,20 @@ class StockAnalyzer:
 
         return cleaned_df
 
-
     def _clean_and_standardize(self, df: pd.DataFrame, df_name: str) -> pd.DataFrame:
-        """通用数据清洗和列名标准化（含 ak.stock_zh_a_spot 的 'code' 字段修复 + 严格过滤ST股 + 股票代码格式统一）"""
+        """
+        通用数据清洗和列名标准化。
+
+        """
         if df.empty:
             return df
 
-        df = utils._normalize_fund_data(df)
+
+        if df_name == "financial_abstract_raw":
+            print(f" - [INFO] 检测到特殊数据源 {df_name}，应用宽表清洗策略。")
+
+            return df
+
 
         def extract_pure_code(code_str):
             """提取纯数字股票代码（去掉 sh/sz/bj 前缀，补齐6位）"""
@@ -130,33 +137,39 @@ class StockAnalyzer:
             # 补齐6位
             return code_str.zfill(6)
 
-
-        # 1. 列名映射
+        # 1. 列名映射 (通用别名处理)
+        # 代码列别名映射
         for old, new in self.config.CODE_ALIASES.items():
             if old in df.columns:
                 df.rename(columns={old: new}, inplace=True)
+        # 名称列别名映射
         for old, new in self.config.NAME_ALIASES.items():
             if old in df.columns:
                 df.rename(columns={old: new}, inplace=True)
+        # 价格列别名映射
         for old, new in self.config.PRICE_ALIASES.items():
             if old in df.columns:
                 df.rename(columns={old: new}, inplace=True)
 
-        # 2. ✅ 确保 '股票代码' 字段存在
-        if '股票代码' not in df.columns:
-            if 'code' in df.columns:
-                df['股票代码'] = df['code'].astype(str).apply(extract_pure_code)
-                print(f"[INFO] 已从 'code' 生成 '股票代码' 列。")
-            elif 'ts_code' in df.columns:
-                df['股票代码'] = df['ts_code'].astype(str).str.split('.').str[0].str.zfill(6)
-            elif 'symbol' in df.columns:
-                df['股票代码'] = df['symbol'].astype(str).apply(extract_pure_code)
+
+        # 如果数据中已经有'股票代码'，则格式化它
+        if '股票代码' in df.columns:
+            df['股票代码'] = df['股票代码'].astype(str).apply(extract_pure_code)
+        else:
+            # 否则尝试从 code/ts_code/symbol 生成
+            code_col = None
+            for col in df.columns:
+                if col.lower() in ['code', 'ts_code', 'symbol']:
+                    code_col = col
+                    break
+
+            if code_col:
+                df['股票代码'] = df[code_col].astype(str).apply(extract_pure_code)
+                print(f"[INFO] 已从 '{code_col}' 生成 '股票代码' 列。")
             else:
+                # 对于非财务宽表的其他数据源，如果还没有代码列，则报错返回空
                 print(f"[ERROR] {df_name} 无 'code'、'ts_code' 或 'symbol' 字段！列名：{df.columns.tolist()}")
                 return pd.DataFrame()
-        else:
-            # ✅ 关键修复：即使已有 '股票代码' 列，也统一格式（去掉前缀）
-            df['股票代码'] = df['股票代码'].astype(str).apply(extract_pure_code)
 
         # 3. ✅ 确保 '最新价' 存在
         if '最新价' not in df.columns:
@@ -167,7 +180,7 @@ class StockAnalyzer:
                 df.rename(columns={'close': '最新价'}, inplace=True)
             else:
                 print(f"[ERROR] {df_name} 无 'price'/'close' 字段！列名：{df.columns.tolist()}")
-                df['最新价'] = 0.0
+                df['最新价'] = 0.0  # 默认值兜底
 
         # 4. ✅ 确保 '股票简称' 存在
         if '股票简称' not in df.columns:
@@ -175,12 +188,11 @@ class StockAnalyzer:
                 df.rename(columns={'name': '股票简称'}, inplace=True)
             elif '简称' in df.columns:
                 df.rename(columns={'简称': '股票简称'}, inplace=True)
-            elif 'symbol' in df.columns:
+            elif 'symbol' in df.columns:  # 防止没有名称时用代码代替
                 df.rename(columns={'symbol': '股票简称'}, inplace=True)
             else:
                 print(f"[WARN] {df_name} 无简称列，使用 'N/A' 作为占位符。")
                 df['股票简称'] = 'N/A'
-
 
         if '股票简称' in df.columns:
             # 改进正则：支持 *ST、ST、(ST)、*ST(退市)、ST*、sT 等写法
@@ -193,39 +205,29 @@ class StockAnalyzer:
             )
             st_count = mask.sum()
             if st_count > 0:
-                df_filtered = df[~mask].copy()
-                print(f"[FILTER] 已过滤 {st_count} 只含 'ST'、'*ST' 的股票，例如：{df[mask]['股票简称'].tolist()[:5]}...")
-            else:
-                df_filtered = df.copy()
-            df = df_filtered
-
-            print(f"[INFO] 过滤前：{len(df)} 只，ST股：{st_count}, 剩余：{len(df_filtered)} 只")
+                df = df[~mask].copy()
+                print(f"[FILTER] 已过滤 {st_count} 只含 'ST'、'*ST' 的股票。")
         else:
             print(f"[WARN] {df_name} 中 '股票简称' 不存在，跳过ST过滤。")
 
-        # 6. 清洗与规范
+        # 6. ✅ 最终清洗
         df.dropna(subset=['股票代码'], inplace=True)
-        df.drop_duplicates(subset=['股票代码'], inplace=True)
-        # ✅ 再次确保股票代码是纯数字6位格式
+        # 去重（保留第一次出现的）
+        df.drop_duplicates(subset=['股票代码'], keep='first', inplace=True)
+        # 再次确保股票代码是纯数字6位格式
         df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
-
-        # ✅ 添加调试输出
-        print(f"[DEBUG] {df_name} 清洗完成：{len(df)} 只股票，股票代码示例：{df['股票代码'].head(5).tolist()}")
 
         return df
 
 
     def _load_industry_info_from_generated_file(self, codes_pure_digits: List[str]) -> pd.DataFrame:
 
-
         from pathlib import Path
-
         file_name = f"StockIndes_{self.today_str}.txt"
         dict_file_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, file_name)
 
-
         if not os.path.exists(dict_file_path):
-            print(f"❌ [ERROR] 文件未找到！请检查路径是否正确。")
+            print(f" [ERROR] 文件未找到！请检查路径是否正确。")
             return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
 
 
@@ -291,12 +293,10 @@ class StockAnalyzer:
             return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
 
         # ✅ 步骤 6：规范化行业和简称列名
-        # 如果文件里有 'industry'，优先用它
         if 'industry' in industry_df_cleaned.columns:
             industry_df_cleaned.rename(columns={'industry': '行业'}, inplace=True)
         elif '行业' not in industry_df_cleaned.columns:
             industry_df_cleaned['行业'] = 'N/A'
-
         if 'name' in industry_df_cleaned.columns:
             industry_df_cleaned.rename(columns={'name': '股票简称'}, inplace=True)
         elif '股票简称' not in industry_df_cleaned.columns:
@@ -374,18 +374,6 @@ class StockAnalyzer:
 
         data['top_industry_cons_df'] = self._get_top_industry_constituents(industry_board_df)
         data['industry_board_df'] = industry_board_df
-
-        # ✅ 调试：确认 spot_data_all 是否有 '股票代码' 与 '最新价'
-        spot_df = data['spot_data_all']
-        if not spot_df.empty:
-            print(f"[DEBUG] spot_data_all 列名: {spot_df.columns.tolist()}")
-            # 核心验证：确保 '股票代码' 和 '最新价' 已生成
-            if '股票代码' not in spot_df.columns:
-                print("[ERROR] '股票代码' 仍未生成，请检查 _clean_and_standardize 是否生效")
-            if '最新价' not in spot_df.columns:
-                print("[ERROR] '最新价' 仍未生成，请检查 _clean_and_standardize 是否生效")
-        else:
-            print("[WARNING] A股实时行情返回空，后续无法关联最新价。")
 
         return data
 
@@ -516,7 +504,6 @@ class StockAnalyzer:
             axis=1
         )
 
-        # 重新命名 '最新价' 为 '当前价格' 以避免与均线价混淆
         filtered_df.rename(columns={'最新价': '当前价格'}, inplace=True)
         return filtered_df.fillna('N/A')
 
@@ -528,7 +515,6 @@ class StockAnalyzer:
         """
         print("\n>>> 正在汇总所有数据和信号 (技术指标作为独立列)...")
 
-        # 以 HistDataWatchDog 同步的股票代码（纯数字）作为最终报告的基础
         final_df = pd.DataFrame(base_stock_codes_pure, columns=['股票代码'])
         final_df['股票代码'] = final_df['股票代码'].astype(str)
 
@@ -769,7 +755,6 @@ class StockAnalyzer:
 
         final_df = final_df[final_df.apply(has_any_signal, axis=1)].copy()
 
-        # 排序时移除 '研报买入次数'
         final_df.sort_values(by=['连涨天数', '放量天数'], ascending=[False, False], inplace=True)
         final_df.reset_index(drop=True, inplace=True)
 
@@ -793,7 +778,7 @@ class StockAnalyzer:
             'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
         ]
         report_cols = [
-            # '研报买入次数', # 已移除
+            '研报买入次数',
             '完全多头排列', '10日均线价', '30日均线价', '60日均线价',
             '资金动能', '5日资金流入', '10日资金流入', '20日资金流入'
         ]
@@ -831,10 +816,7 @@ class StockAnalyzer:
             code_format = workbook.add_format({'num_format': '@'})
 
             for sheet_name, df in sheets_data.items():
-                # 移除 '主力研报筛选' 工作表
-                if sheet_name == '主力研报筛选':
-                    print(f"  - 警告：工作表 '{sheet_name}' 已根据需求移除。")
-                    continue
+
                 if df is None or df.empty:
                     print(f"  - 警告：工作表 '{sheet_name}' 数据为空，跳过创建。")
                     continue
@@ -913,8 +895,6 @@ class StockAnalyzer:
             # 预处理行业权重数据
             industry_analyzer = industry.IndustryFlowAnalyzer(self.config)
             industry_analysis_df = industry_analyzer.run_analysis()
-
-            # 获取所有原始数据 (实时行情、研报等，这些仍来自Akshare，不是HistDataWatchDog同步的K线)
             raw_data = self._get_all_raw_data()
             processed_main_report = pd.DataFrame()
 
@@ -940,7 +920,6 @@ class StockAnalyzer:
                         hist_df_all = pd.read_sql(query, conn)
 
                         if not hist_df_all.empty:
-                            print(f"[DEBUG] 数据列: {hist_df_all.columns.tolist()}")
                             print(
                                 f"[DEBUG] 数据日期范围: {hist_df_all['trade_date'].min()} 至 {hist_df_all['trade_date'].max()}")
                         else:
