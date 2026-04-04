@@ -16,16 +16,10 @@ class Config:
             raise FileNotFoundError(f"配置文件未找到: {os.path.abspath(self.config_file)}")
 
     def _load_config(self):
-        print("[DEBUG] 开始加载 config.ini...")
+
         config = configparser.ConfigParser()
         config.read(self.config_file, encoding='utf-8')
 
-            # 👇 打印所有 section 和 key
-        print("[DEBUG] 配置文件中的所有内容：")
-        for section in config.sections():
-              print(f"  [{section}]")
-        for key, value in config.items(section):
-              print(f"    {key} = {value}")
 
             # 读取数据库配置
         db = config['DATABASE']
@@ -42,9 +36,6 @@ class Config:
         temp_dir = system.get('TEMP_DATA_DIR', 'ShareData')
         self.TEMP_DATA_DIRECTORY = os.path.join(self.HOME_DIRECTORY, temp_dir)
 
-            # 👇 重要：打印 TEMP_DATA_DIR 是否被正确读取！
-        print(f"[DEBUG] 系统配置中 TEMP_DATA_DIR: {temp_dir}（原始值）")
-        print(f"[DEBUG] TEMP_DATA_DIRECTORY 路径: {self.TEMP_DATA_DIRECTORY}")
 
         self.MAX_WORKERS = system.getint('MAX_WORKERS', fallback=15)
         self.DATA_FETCH_RETRIES = system.getint('DATA_FETCH_RETRIES', fallback=3)
@@ -56,7 +47,7 @@ class Config:
         self.PRICE_ALIASES = {'最新价': '最新价', '现价': '最新价', '当前价格': '最新价', '今收盘': '最新价',
                               '收盘': '最新价', '收盘价': '最新价'}
 
-        # 新增：读取 Tushare Token
+
         self.TUSHARE_TOKEN = db.get('tushare_token')  # 如果没有配置，默认为 None
         if not self.TUSHARE_TOKEN:
             raise ValueError("配置文件中缺少 'tushare_token'，请在 [DATABASE] 节点下添加。")
