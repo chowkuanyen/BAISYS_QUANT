@@ -33,36 +33,33 @@ class QuantDBManager:
             print(f"  - [数据库] 表 {table_name} 无有效数据，跳过写入。")
             return
 
-        # 1. 数据预处理
-        df_to_save = df.copy()
-
-
-        df_to_save = df_to_save.reset_index(drop=True)
-
-
-        if date_column not in df_to_save.columns:
-            df_to_save[date_column] = today_str
-
+        if date_column in df.columns:
+            df = df.copy()
+            df[date_column] = today_str  # 强制覆盖为业务日期
+        else:
+            # 如果没有，则添加
+            df = df.assign(**{date_column: today_str})
 
         with self.engine.connect() as conn:
             trans = conn.begin()
             try:
-                # 删除当天的旧数据，实现覆盖式更新
+                # --- 修改点 2: 使用传入的 today_str 进行删除 ---
+                # 这里的逻辑是正确的，因为我们传入的是交易日
                 delete_query = text(f"DELETE FROM {table_name} WHERE {date_column} = :today")
                 result = conn.execute(delete_query, {"today": today_str})
                 trans.commit()
-                print(f"  - [数据库] {table_name} 清理旧记录: {result.rowcount} 条")
+                print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
+
             except Exception as e:
                 trans.rollback()
-                print(f"  - [数据库错误] {table_name} 清理失败: {e}")
+                print(f" - [数据库错误] {table_name} 清理失败: {e}")
                 return
 
-
-        try:
-            self._fast_pg_copy(df_to_save, table_name)
-            print(f"  - [数据库] {table_name} 成功插入新数据: {len(df_to_save)} 条")
-        except Exception as e:
-            print(f"  - [数据库错误] {table_name} COPY 写入失败: {e}")
+            try:
+                self._fast_pg_copy(df, table_name)
+                print(f" - [数据库] {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
+            except Exception as e:
+                print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
 
     def _fast_pg_copy(self, df, table_name):
         """

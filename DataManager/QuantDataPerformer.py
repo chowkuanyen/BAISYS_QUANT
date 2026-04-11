@@ -38,17 +38,13 @@ class QuantDBSyncTask:
     def sync_all(self, today_str, consolidated_report, industry_df, raw_data):
         """执行全量同步主入口"""
         print("\n" + "=" * 50)
-        print(f">>> 启动数据库资产化同步任务: {today_str}")
+        print(f">>> 启动数据库资产化同步任务 业务日期: {today_str}")
         print("=" * 50)
 
         try:
             # 1. 同步策略触发归档 (支持一码多策略)
             self._sync_strategy_stocks(today_str, raw_data)
-
-            # 2. 同步行业板块动能分析
             self._sync_industry_data(today_str, industry_df)
-
-            # 3. 同步最终综合决策报告
             self._sync_final_report(today_str, consolidated_report)
 
         except Exception as e:

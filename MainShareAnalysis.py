@@ -21,7 +21,9 @@ import configparser
 from pathlib import Path
 from ConfigParser import Config
 from FormatManager.ShareCodeFormatMgr import format_stock_code
-from Distribution import MainCostDataManager  # 导入新的主力成本数据管理类
+from Distribution import MainCostDataManager
+from DataManager.CalendarManager import  TradingCalendarAnalyzer
+
 
 
 class StockAnalyzer:
@@ -29,7 +31,8 @@ class StockAnalyzer:
     def __init__(self, config_file: str = "config.ini"):
         self.config_file = config_file
         self.config = Config(config_file=config_file)
-        self.today_str = datetime.now().strftime("%Y%m%d")
+        self.calendar_mgr = TradingCalendarAnalyzer()
+        self.today_str = self.calendar_mgr.get_last_trading_day()
         self.temp_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.temp_dir, exist_ok=True)
         self.executor = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
@@ -890,11 +893,13 @@ class StockAnalyzer:
     def run(self):
 
         print(f"[INFO]  股票分析程序启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[INFO] 识别的业务日期(最后一个交易日)为: {self.today_str}") # 日志提示
+
 
         try:
 
             self.sync_engine.run_engine()
-
+            self.sync_engine.run_engine(target_date=self.today_str)
             synced_codes_df_from_db = pd.DataFrame(columns=['symbol'])  # 初始化为空，以防查询失败
 
             try:

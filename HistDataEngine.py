@@ -3,6 +3,8 @@ import akshare as ak
 import pandas as pd
 import datetime
 import time
+from DataManager.CalendarManager import TradingCalendarAnalyzer
+
 import urllib3.util
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
@@ -12,6 +14,7 @@ import json
 from typing import List, Set, Optional
 from FormatManager.ShareCodeFormatMgr import format_stock_code
 from ConfigParser import Config
+
 
 class StockSyncEngine:
     AKSHARE_RETRIES = 3
@@ -32,13 +35,14 @@ class StockSyncEngine:
             database=self.config.DB_NAME
         )
 
-
         #  初始化数据库引擎
         self.db = create_engine(
             url_object,
             pool_pre_ping=True,
             pool_recycle=3600,
-            echo=False
+            echo=False,
+            client_encoding='utf8'
+
         )
 
         #  测试数据库连接
@@ -149,8 +153,10 @@ class StockSyncEngine:
 
         return stock_index_df[required_cols]
 
-    def _safe_ak_fetch(self, fetch_func: callable, description: str, cleaned_file_path: str = None, **kwargs) -> pd.DataFrame:
+    def _safe_ak_fetch(self, fetch_func: callable, description: str, cleaned_file_path: str = None,
+                       **kwargs) -> pd.DataFrame:
         """带重试、缓存、清洗的 Akshare 数据获取。"""
+
         def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
             if df.empty:
                 return df
@@ -250,7 +256,8 @@ class StockSyncEngine:
         report_df['股票代码'] = report_df['股票代码'].astype(str).str.zfill(6)
 
         # 过滤
-        report_df['机构投资评级(近六个月)-买入'] = pd.to_numeric(report_df['机构投资评级(近六个月)-买入'], errors='coerce').fillna(0)
+        report_df['机构投资评级(近六个月)-买入'] = pd.to_numeric(report_df['机构投资评级(近六个月)-买入'],
+                                                                 errors='coerce').fillna(0)
         qualified = report_df[report_df['机构投资评级(近六个月)-买入'] > 1]['股票代码'].unique()
 
         result = set(qualified)
@@ -269,7 +276,8 @@ class StockSyncEngine:
     def _fetch_kline_for_symbol(self, symbol: str) -> pd.DataFrame:
         """获取单个股票的前复权 + 不复权数据，合并输出"""
         try:
-            df_qfq = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self.global_start, end_date=self.today, adjust="qfq")
+            df_qfq = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self.global_start, end_date=self.today,
+                                           adjust="qfq")
             time.sleep(0.05)
             if df_qfq.empty:
                 return None
@@ -322,13 +330,19 @@ class StockSyncEngine:
             print(f"[ERROR] 清空失败: {e}")
             raise
 
-    def run_engine(self):
+    def run_engine(self, target_date: str = None):
         """主运行函数：研报过滤 + K线数据同步"""
-        print(f"[DEBUG] 起始日期: {self.global_start}, 今日: {self.today}")
 
-        if self.db is None:
-            print("[CRITICAL] 数据库未初始化")
-            return
+        if target_date is None:
+            target_date = TradingCalendarAnalyzer().get_last_trading_day()
+            pass
+        if target_date is None:
+            target_date = datetime.datetime.now().strftime("%Y%m%d")
+
+        self.today_str = target_date
+        self.today_dt = pd.to_datetime(target_date).normalize()
+
+        print(f"[DEBUG] 数据引擎运行日期: {self.today_str}")
 
         # Step 1: 获取 Tushare 基础池
         tushare_df = self.get_main_board_pool()
@@ -369,7 +383,6 @@ class StockSyncEngine:
                     df['symbol'] = df['symbol'].astype(str)
                     print(f"  - ✅ 成功加载缓存，共 {len(df)} 条记录。")
 
-
                     try:
                         df.to_sql(
                             name='stock_daily_kline',
@@ -383,7 +396,6 @@ class StockSyncEngine:
                     except Exception as e:
                         print(f"[ERROR] 写入数据库失败: {e}")
                         raise
-
 
                     final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
                     try:
@@ -402,8 +414,6 @@ class StockSyncEngine:
 
             except Exception as e:
                 print(f"[WARN] 缓存加载失败: {e}")
-
-
 
         filtered_codes = final_codes  # ←  这才是真正的"最终要处理的股票"
         print(f"[INFO]  将获取 {len(filtered_codes)} 只股票的 K 线（基于交集结果）。")
@@ -473,7 +483,6 @@ class StockSyncEngine:
         print(f"  - 筛选股票数: {len(filtered_codes)}")
         print(f"  - 成功获取 K 线股票: {len(kline_dfs)}")
         print(f"  - 写入数据库条数: {len(combined_kline_df)}")
-
 
         #  可选：保存最终过滤列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
