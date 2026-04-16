@@ -20,7 +20,7 @@ DB_CONFIG = {
     'port': '5432',
     'database': 'Corenews',
     'user': 'postgres',
-    'password': ' '
+    'password': '025874yan'
 }
 
 DB_URI = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
@@ -188,7 +188,7 @@ engine.dispose()
 close_on_signal_map = {}
 for _, row in df_signal_close.iterrows():
     symbol = row['symbol']
-    date_str = row['trade_date'].strftime('%Y-%m-%d')
+    date_str = row['trade_date']
     close_val = row['close']
     # 反向找 stock_code
     for code, info in stock_info_map.items():
