@@ -55,7 +55,7 @@ class MACDAnalyzer:
             df[cross_col] = np.where(is_cross, 1, 0)
 
             df.drop(columns=[ema_fast_col, ema_slow_col], inplace=True, errors='ignore')
-            print(f"✅ 生成信号 for {name}: {df[signal_col].iloc[-1]} (DIF={df[dif_col].iloc[-1]:.4f})")
+
 
         return df
 
