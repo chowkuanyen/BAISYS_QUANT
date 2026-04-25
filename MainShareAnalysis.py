@@ -203,7 +203,7 @@ class StockAnalyzer:
 
         from pathlib import Path
         file_name = f"StockIndes_{self.today_str}.txt"
-        dict_file_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, file_name)
+        dict_file_path = os.path.join(self.temp_dir, file_name)
 
         if not os.path.exists(dict_file_path):
             print(f" [ERROR] 文件未找到！请检查路径是否正确。")
