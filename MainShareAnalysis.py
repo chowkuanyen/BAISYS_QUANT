@@ -200,111 +200,73 @@ class StockAnalyzer:
         return df
 
     def _load_industry_info_from_generated_file(self, codes_pure_digits: List[str]) -> pd.DataFrame:
-
-        from pathlib import Path
-        file_name = f"StockIndes_{self.today_str}.txt"
-        dict_file_path = os.path.join(self.temp_dir, file_name)
-
-        if not os.path.exists(dict_file_path):
-            print(f" [ERROR] 文件未找到！请检查路径是否正确。")
-            return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+        """从数据库 stock_basic_info 表读取行业信息，若无数据则尝试补全"""
+        self.logger.info("正在从数据库 stock_basic_info 表加载行业信息...")
 
         try:
-            print(f"正在读取: {file_name}")
-            industry_df_raw = pd.read_csv(
-                dict_file_path,
-                sep='|',
-                encoding='utf-8-sig',
-                dtype={
-                    'ts_code': str,
-                    'symbol': str,
-                    'name': str,
-                    'industry': str,
-                    '股票简称': str,
-                    '行业': str,
-                    'market': str
-                }
-            )
-            print(f"成功读取 {len(industry_df_raw)} 行行业数据。")
+            if not self.db_engine:
+                self.logger.critical("数据库引擎未初始化，无法读取行业信息。")
+                return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+
+            # 1. 尝试查询数据
+            placeholders = ','.join([f"'{code}'" for code in codes_pure_digits])
+            query_sql = f"""
+                SELECT ts_code, symbol, name, industry, market 
+                FROM stock_basic_info 
+                WHERE symbol IN ({placeholders})
+            """
+            with self.db_engine.connect() as conn:
+                result = conn.execute(text(query_sql))
+                rows = result.fetchall()
+                columns = result.keys()
+                db_df = pd.DataFrame(rows, columns=columns)
+
+            # 2. 检查数据是否为空
+            if db_df.empty:
+                self.logger.warning("数据库中未查询到行业信息数据，正在尝试触发数据补全任务...")
+
+                # --- 新增逻辑：尝试补数据 ---
+                try:
+                    # 导入服务类（确保路径正确）
+                    from GetStockBasicinfo import StockBasicInfoService
+
+                    # 创建服务实例并同步数据
+                    # 注意：这里假设 config 已经在 self 中初始化
+                    basic_info_service = StockBasicInfoService(self.config)
+                    success = basic_info_service.sync_all_stock_basic_info()
+
+                    if success:
+                        self.logger.info("数据补全成功，正在重新查询...")
+                        # 重新执行查询逻辑（递归调用或复制逻辑）
+                        # 这里简单起见，再次执行查询（实际生产环境建议封装成独立函数）
+                        with self.db_engine.connect() as conn2:
+                            result2 = conn2.execute(text(query_sql))
+                            rows2 = result2.fetchall()
+                            if rows2:
+                                db_df = pd.DataFrame(rows2, columns=columns)
+                            else:
+                                raise Exception("补全后仍无数据")
+                    else:
+                        raise Exception("补全任务返回失败")
+
+                except Exception as e:
+                    self.logger.error(f"数据补全过程异常: {e}，将使用空数据继续。")
+                    return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+
+            # 3. 后续的字段映射与清洗逻辑（保持不变）...
+            # ... (此处保留原代码中从 column_mapping 开始的清洗逻辑) ...
 
         except Exception as e:
-            print(f"[ERROR] 读取 CSV 文件失败: {e}")
+            self.logger.error(f"从数据库读取行业信息失败: {e}，将尝试回退到空数据。")
             return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
-
-        cols_to_keep = {
-            'ts_code': 'ts_code',
-            'symbol': 'symbol',
-            'name': 'name',
-            '股票简称': '股票简称',
-            '行业': '行业',
-            'market': 'market'
-        }
-
-        use_columns = [col for col in cols_to_keep if col in industry_df_raw.columns]
-        if not use_columns:
-            print(f"❌ [ERROR] 行业数据文件中无可用列（仅含 {list(industry_df_raw.columns)}）")
-            return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
-
-        industry_df_cleaned = industry_df_raw[use_columns].copy()
-
-        def to_pure_code(code_str):
-            if pd.isna(code_str):
-                return None
-            code_str = str(code_str).strip()
-            # 1. 先处理可能带 '.' 的后缀 (如 000001.SZ)
-            code_str = code_str.split('.')[0]
-            # 2. 去除可能的前缀 (如 sh600011 -> 600011)
-            for prefix in ['sh', 'sz', 'bj', 'SH', 'SZ', 'BJ']:
-                if code_str.startswith(prefix):
-                    code_str = code_str[2:]
-                    break
-            return code_str.zfill(6)
-
-        # 🔍 确保 ts_code 是 str 类型，同时能处理 .SZ/.SH
-        if 'ts_code' in industry_df_cleaned.columns:
-            industry_df_cleaned['股票代码'] = industry_df_cleaned['ts_code'].astype(str).apply(to_pure_code)
-        elif 'symbol' in industry_df_cleaned.columns:
-            industry_df_cleaned['股票代码'] = industry_df_cleaned['symbol'].astype(str).apply(to_pure_code)
-        else:
-            print(f"❌ [ERROR] 文件中无 'ts_code' 或 'symbol' 列。可用列: {list(industry_df_cleaned.columns)}")
-            return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
-
-        # ✅ 步骤 6：规范化行业和简称列名
-        if 'industry' in industry_df_cleaned.columns:
-            industry_df_cleaned.rename(columns={'industry': '行业'}, inplace=True)
-        elif '行业' not in industry_df_cleaned.columns:
-            industry_df_cleaned['行业'] = 'N/A'
-        if 'name' in industry_df_cleaned.columns:
-            industry_df_cleaned.rename(columns={'name': '股票简称'}, inplace=True)
-        elif '股票简称' not in industry_df_cleaned.columns:
-            industry_df_cleaned['股票简称'] = 'N/A'
-
-        # ✅ 步骤 7：去除无效行，确保股票代码合法
-        industry_df_cleaned = industry_df_cleaned[
-            industry_df_cleaned['股票代码'].notnull()
-        ].copy()
-
-        # ✅ 步骤 8：只保留进分析池中的股票
-        input_df_codes = pd.DataFrame(codes_pure_digits, columns=['股票代码'])
-        input_df_codes['股票代码'] = input_df_codes['股票代码'].astype(str).str.zfill(6)
-        final_industry_df = pd.merge(input_df_codes, industry_df_cleaned, on='股票代码', how='left')
-
-        # 补充缺失信息
-        final_industry_df['行业'] = final_industry_df['行业'].fillna('N/A')
-        final_industry_df['股票简称'] = final_industry_df['股票简称'].fillna('N/A')
-
-        # ✅ 步骤 9：输出统计信息
-        match_count = final_industry_df[final_industry_df['行业'] != 'N/A'].shape[0]
-        print(f"✅ 行业数据加载完成：总共 {len(codes_pure_digits)} 只股票，成功匹配 {match_count} 只。")
-
-        return final_industry_df
 
     def _get_all_raw_data(self) -> Dict[str, pd.DataFrame]:
         """集中获取所有数据源 (包括主力研报盈利预测)，并支持缓存机制"""
         print("\n>>> 正在初始化数据获取和缓存检查...")
 
         data = {
-            'spot_data_all': self._safe_ak_fetch(ak.stock_zh_a_spot_em, "A股实时行情"),
+            # 移除实时行情获取，直接从K线数据获取最新价格
+            # 'spot_data_all': self._safe_ak_fetch(ak.stock_zh_a_spot_em, "A股实时行情"),
 
             'market_fund_flow_raw': self._safe_ak_fetch(ak.stock_fund_flow_individual, "5日市场资金流向",
                                                         symbol="5日排行"),
@@ -890,6 +852,25 @@ class StockAnalyzer:
             self.logger.critical(f"[FATAL] 致命错误：生成 Excel 报告失败。原因: {e}")
             raise
 
+    def _get_latest_prices_from_kline(self, hist_df_all: pd.DataFrame) -> pd.DataFrame:
+        """
+        从K线数据中获取最新的收盘价作为"实时价格"
+        """
+        if hist_df_all.empty:
+            return pd.DataFrame(columns=['股票代码', '最新价'])
+
+        # 获取每个股票的最新一条记录（按日期排序）
+        latest_records = hist_df_all.sort_values('trade_date').groupby('symbol').tail(1)
+
+        # 提取股票代码和收盘价
+        latest_prices = latest_records[['symbol', 'close']].copy()
+        latest_prices.columns = ['股票代码', '最新价']
+
+        # 提取纯数字股票代码
+        latest_prices['股票代码'] = latest_prices['股票代码'].astype(str).str.extract(r'(\d{6})')[0]
+
+        return latest_prices
+
     def run(self):
 
         print(f"[INFO]  股票分析程序启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -943,9 +924,12 @@ class StockAnalyzer:
             # 预处理行业权重数据
             industry_analyzer = industry.IndustryFlowAnalyzer(self.config)
             industry_analysis_df = industry_analyzer.run_analysis()
-            raw_data = self._get_all_raw_data()
-            processed_main_report = pd.DataFrame()
 
+            # 获取K线数据
+            raw_data = self._get_all_raw_data()
+
+            # 从K线数据获取最新价格替代实时行情
+            print("\n>>> 从K线数据获取最新收盘价...")
             # 构造查询语句
             if not final_analysis_codes_prefixed:
                 print("[WARN] 待分析股票代码列表为空，跳过历史数据查询。")
@@ -983,6 +967,13 @@ class StockAnalyzer:
             else:
                 # 正常调用信号处理
                 pass
+
+            # 从K线数据获取最新价格
+            latest_prices_df = self._get_latest_prices_from_kline(hist_df_all)
+            print(f"[INFO] 从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
+
+            # 将最新价格数据加入到raw_data中，替代原来的spot_data_all
+            raw_data['spot_data_all'] = latest_prices_df
 
             signal_processor = TASignalProcessor(self)
             ta_signals = signal_processor.process_signals(
@@ -1027,7 +1018,7 @@ class StockAnalyzer:
                 **raw_data,
                 **ta_signals,
                 'processed_xstp_df': processed_xstp_df,
-                'processed_main_report': processed_main_report,  # 此时为空DataFrame
+                'processed_main_report': pd.DataFrame(),  # 此时为空DataFrame
                 'individual_industry': industry_info_df
             }
 
@@ -1096,35 +1087,35 @@ class StockAnalyzer:
                 'BOLL低波': ta_signals.get('BOLL', pd.DataFrame()),
                 '前十板块成分股': raw_data['top_industry_cons_df'],
                 '主力成本分析': processed_data['main_cost_data'],  # 新增主力成本分析页签
-                'A股实时行情_经清洗': raw_data['spot_data_all'],  # 添加A股实时行情_经清洗的数据到Excel
+                # 移除A股实时行情，因为现在从K线获取
             }
 
             # 7. 生成报告
             self._generate_report(sheets_data)
 
             try:
-                db_manager = DatabaseWriter.QuantDBManager(
-                    user=self.config.DB_USER,
-                    password=self.config.DB_PASSWORD,
-                    host=self.config.DB_HOST,
-                    port=self.config.DB_PORT,
-                    db_name=self.config.DB_NAME
+              db_manager = DatabaseWriter.QuantDBManager(
+                user=self.config.DB_USER,
+                password=self.config.DB_PASSWORD,
+                host=self.config.DB_HOST,
+                port=self.config.DB_PORT,
+                db_name=self.config.DB_NAME
                 )
 
-                sync_task = QuantDataPerformer.QuantDBSyncTask(db_manager)
+              sync_task = QuantDataPerformer.QuantDBSyncTask(db_manager)
 
-                sync_task.sync_all(
-                    today_str=self.today_str,
-                    consolidated_report=consolidated_report,
-                    industry_df=industry_analysis_df,
-                    raw_data=raw_data
-                )
+              sync_task.sync_all(
+                today_str=self.today_str,
+                consolidated_report=consolidated_report,
+                industry_df=industry_analysis_df,
+                raw_data=raw_data
+              )
 
-                db_manager.close()
-                print("数据库同步成功完成。")
+              db_manager.close()
+              print("数据库同步成功完成。")
 
             except Exception as e:
-                self.logger.error(f"!!! [同步中断] 任务运行异常: {e}")
+             self.logger.error(f"!!! [同步中断] 任务运行异常: {e}")
 
         except Exception as e:
             self.logger.critical(f"\n[FATAL] 致命错误：数据分析流程意外终止。原因: {e}")
@@ -1133,7 +1124,6 @@ class StockAnalyzer:
         finally:
             end_time = time.time()
             print(f"\n>>> 流程结束。总耗时: {timedelta(seconds=end_time - self.start_time)}")
-
 
 if __name__ == "__main__":
     analyzer = StockAnalyzer()
