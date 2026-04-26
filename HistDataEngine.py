@@ -49,20 +49,17 @@ class StockSyncEngine:
         try:
             with self.db.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            print("[INFO]  数据库引擎初始化成功，连接测试通过。")
+            print("[INFO]  数据库引擎初始化成功")
         except Exception as e:
-            print(f"  - 错误详情: {type(e).__name__}: {e}")
-            raise RuntimeError("数据库引擎初始化失败，程序无法继续。") from e
+            raise RuntimeError("数据库引擎初始化失败") from e
 
         self.global_start = "20250301"
         self.today = datetime.datetime.now().strftime("%Y%m%d")
         self.today_dt = pd.to_datetime(self.today).normalize()
-
-        # 修复路径初始化问题：使用配置中的临时目录而不是URL对象
         self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
 
-        # 缓存文件路径（已处理，带完整数据）
+        # 缓存文件路径
         self.main_report_cache_path = os.path.join(
             self.base_data_dir,
             f"主力研报盈利预测_完整数据_{self.today}_已处理.csv"
@@ -85,73 +82,41 @@ class StockSyncEngine:
 
     def get_main_board_pool(self) -> pd.DataFrame:
         """
-        获取 Tushare 主板股票池（支持本地缓存）。
-        返回包含 ts_code、name、industry、股票代码 的 DataFrame。
+        从数据库获取主板股票池
+        返回包含 ts_code、name、industry
         """
         try:
-            from Ts_GetStockBasicinfo import TushareStockManager
-        except ImportError:
-            print("[ERROR] 无法导入 Ts_GetStockBasicinfo 模块")
-            return pd.DataFrame(columns=['ts_code', 'name', 'industry', '股票代码'])
+            # 直接从数据库查询股票基本信息
+            query = """
+            SELECT 
+                ts_code,
+                symbol as 股票代码,
+                name,
+                industry
+            FROM stock_basic_info
+            ORDER BY symbol
+            """
 
-        date_suffix = self.today
-        filename = f"StockIndes_{date_suffix}.txt"
-        dict_file_path = os.path.join(self.base_data_dir, filename)
+            with self.db.connect() as conn:
+                stock_index_df = pd.read_sql(text(query), conn)
 
-        stock_index_df = pd.DataFrame()
-        required_cols = ['ts_code', 'name', 'industry', '股票代码']
+            print(f"[INFO] 从数据库获取 {len(stock_index_df)} 只股票。")
 
-        if not os.path.exists(dict_file_path):
-            print(f"[INFO] 未发现本地文件: {dict_file_path}，尝试通过 Tushare 获取。")
-            try:
-                manager = TushareStockManager(self.token)
-                stock_index_df = manager.get_basic_data(list_status='L', market='主板', save_path=dict_file_path)
-                print(f"[INFO] 股票字典保存至: {dict_file_path}")
-            except Exception as e:
-                print(f"[ERROR] Tushare 获取失败: {e}")
-                return pd.DataFrame(columns=required_cols)
-        else:
-            print(f"[INFO] 本地文件已存在: {dict_file_path}，正在加载...")
-            try:
-                stock_index_df = pd.read_csv(
-                    dict_file_path,
-                    sep='|',
-                    encoding='utf-8-sig',
-                    dtype={'ts_code': str, 'symbol': str, 'name': str, 'industry': str,
-                           '股票简称': str, '行业': str, 'market': str, '股票代码': str}
-                )
-
-                # 重命名标准化
-                if 'ts_code' not in stock_index_df.columns:
-                    if 'symbol' in stock_index_df.columns:
-                        stock_index_df.rename(columns={'symbol': 'ts_code'}, inplace=True)
-                    else:
-                        stock_index_df['ts_code'] = 'N/A'
-                if 'name' not in stock_index_df.columns:
-                    if '股票简称' in stock_index_df.columns:
-                        stock_index_df.rename(columns={'股票简称': 'name'}, inplace=True)
-                    else:
-                        stock_index_df['name'] = 'N/A'
-                if 'industry' not in stock_index_df.columns:
-                    if '行业' in stock_index_df.columns:
-                        stock_index_df.rename(columns={'行业': 'industry'}, inplace=True)
-                    else:
-                        stock_index_df['industry'] = 'N/A'
-                if '股票代码' not in stock_index_df.columns:
-                    stock_index_df['股票代码'] = stock_index_df['ts_code'].str.split('.').str[0]
-
+            # 标准化股票代码格式（确保6位数字）
+            if '股票代码' in stock_index_df.columns:
                 stock_index_df['股票代码'] = stock_index_df['股票代码'].astype(str).str.zfill(6)
 
-                print(f"[INFO] 从本地加载 {len(stock_index_df)} 只股票。")
-            except Exception as e:
-                print(f"[ERROR] 加载本地文件失败: {e}，返回空 DataFrame")
-                return pd.DataFrame(columns=required_cols)
+            required_cols = ['ts_code', 'name', 'industry', '股票代码']
+            for col in required_cols:
+                if col not in stock_index_df.columns:
+                    stock_index_df[col] = 'N/A'
 
-        for col in required_cols:
-            if col not in stock_index_df.columns:
-                stock_index_df[col] = 'N/A'
+            return stock_index_df[required_cols]
 
-        return stock_index_df[required_cols]
+        except Exception as e:
+            print(f"[ERROR] 从数据库获取股票池失败: {e}")
+            # 如果数据库查询失败，返回空DataFrame
+            return pd.DataFrame(columns=['ts_code', 'name', 'industry', '股票代码'])
 
     def _safe_ak_fetch(self, fetch_func: callable, description: str, cleaned_file_path: str = None,
                        **kwargs) -> pd.DataFrame:
@@ -344,13 +309,13 @@ class StockSyncEngine:
 
         print(f"[DEBUG] 数据引擎运行日期: {self.today_str}")
 
-        # Step 1: 获取 Tushare 基础池
+        # Step 1: 获取数据库中的股票池
         tushare_df = self.get_main_board_pool()
         if tushare_df.empty or '股票代码' not in tushare_df.columns:
             print("[CRITICAL] 基础股票池无效")
             return
         tushare_pure_codes = set(tushare_df['股票代码'].unique().tolist())
-        print(f"[INFO] Tushare 共获取 {len(tushare_pure_codes)} 只股票。")
+        print(f"[INFO] 从数据库获取 {len(tushare_pure_codes)} 只股票。")
 
         # Step 2: 获取研报符合条件的股票
         report_codes = self._get_research_report_filtered_symbols()
@@ -369,7 +334,7 @@ class StockSyncEngine:
         #  Step 4: 缓存检查 → 决定是否重取
 
         if os.path.exists(self.kline_cache_path):
-            print(f"  - ✅ 缓存文件存在: {os.path.basename(self.kline_cache_path)}")
+            print(f" 缓存文件存在: {os.path.basename(self.kline_cache_path)}")
             try:
                 df = pd.read_csv(self.kline_cache_path, sep='|', encoding='utf-8-sig')
                 # 确保字段存在
@@ -381,7 +346,7 @@ class StockSyncEngine:
                 else:
                     # 将 symbol 明确转换为 sh/sz/bj 格式（可选）
                     df['symbol'] = df['symbol'].astype(str)
-                    print(f"  - ✅ 成功加载缓存，共 {len(df)} 条记录。")
+                    print(f" 成功加载缓存，共 {len(df)} 条记录。")
 
                     try:
                         df.to_sql(
@@ -392,7 +357,7 @@ class StockSyncEngine:
                             method='multi',
                             chunksize=5000
                         )
-                        print(f"[INFO] ✅ 成功将 {len(df)} 条记录写入 'stock_daily_kline' 表。")
+                        print(f"成功将 {len(df)} 条记录写入 'stock_daily_kline' 表。")
                     except Exception as e:
                         print(f"[ERROR] 写入数据库失败: {e}")
                         raise
@@ -408,7 +373,6 @@ class StockSyncEngine:
 
                     print(f"  - 今日日期: {self.today}")
                     print(f"  - 筛选股票数: {len(final_codes)}")
-                    print(f"  - 写入数据库条数: {len(df)}")
 
                     return
 
@@ -482,7 +446,6 @@ class StockSyncEngine:
         print(f"  - 今日日期: {self.today}")
         print(f"  - 筛选股票数: {len(filtered_codes)}")
         print(f"  - 成功获取 K 线股票: {len(kline_dfs)}")
-        print(f"  - 写入数据库条数: {len(combined_kline_df)}")
 
         #  可选：保存最终过滤列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
