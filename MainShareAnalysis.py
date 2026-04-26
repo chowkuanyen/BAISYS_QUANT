@@ -203,10 +203,13 @@ class StockAnalyzer:
         """从数据库 stock_basic_info 表读取行业信息，若无数据则尝试补全"""
         self.logger.info("正在从数据库 stock_basic_info 表加载行业信息...")
 
+        # 初始化一个空的、具有正确列的 DataFrame 作为默认返回值
+        default_return_df = pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+
         try:
             if not self.db_engine:
                 self.logger.critical("数据库引擎未初始化，无法读取行业信息。")
-                return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+                return default_return_df
 
             # 1. 尝试查询数据
             placeholders = ','.join([f"'{code}'" for code in codes_pure_digits])
@@ -231,34 +234,119 @@ class StockAnalyzer:
                     from GetStockBasicinfo import StockBasicInfoService
 
                     # 创建服务实例并同步数据
-                    # 注意：这里假设 config 已经在 self 中初始化
                     basic_info_service = StockBasicInfoService(self.config)
                     success = basic_info_service.sync_all_stock_basic_info()
 
                     if success:
                         self.logger.info("数据补全成功，正在重新查询...")
-                        # 重新执行查询逻辑（递归调用或复制逻辑）
-                        # 这里简单起见，再次执行查询（实际生产环境建议封装成独立函数）
+                        # 重新执行查询逻辑
                         with self.db_engine.connect() as conn2:
                             result2 = conn2.execute(text(query_sql))
                             rows2 = result2.fetchall()
                             if rows2:
                                 db_df = pd.DataFrame(rows2, columns=columns)
                             else:
-                                raise Exception("补全后仍无数据")
+                                raise Exception("补全后重新查询仍无数据")
                     else:
                         raise Exception("补全任务返回失败")
 
                 except Exception as e:
                     self.logger.error(f"数据补全过程异常: {e}，将使用空数据继续。")
-                    return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+                    return default_return_df
 
-            # 3. 后续的字段映射与清洗逻辑（保持不变）...
-            # ... (此处保留原代码中从 column_mapping 开始的清洗逻辑) ...
+            # 3. 后续的字段映射与清洗逻辑（**必须在此处进行包裹**）
+            # --- 关键修改：将清洗逻辑包裹在一个 try 块中 ---
+            try:
+                # 定义数据库字段到程序内部字段的映射
+                column_mapping = {
+                    'ts_code': 'ts_code',
+                    'symbol': 'symbol',
+                    'name': '股票简称',
+                    'industry': '行业',
+                    'market': '市场'
+                }
+
+                # 仅保留存在的列
+                available_columns = [col for col in column_mapping.keys() if col in db_df.columns]
+                industry_df_cleaned = db_df[available_columns].copy()
+
+                # 生成标准的 '股票代码' 列 (6位纯数字)
+                def generate_pure_code(row):
+                    if 'symbol' in row.index and pd.notna(row['symbol']):
+                        code_str = str(row['symbol']).strip()
+                        if len(code_str) == 6 and code_str.isdigit():
+                            return code_str
+                        digits = ''.join(filter(str.isdigit, code_str))
+                        if len(digits) == 6:
+                            return digits
+                    if 'ts_code' in row.index and pd.notna(row['ts_code']):
+                        code_str = str(row['ts_code']).upper()
+                        for suffix in ['.SH', '.SZ', '.BJ']:
+                            if code_str.endswith(suffix):
+                                code_str = code_str[:-len(suffix)]
+                                break
+                        for prefix in ['SH', 'SZ', 'BJ']:
+                            if code_str.startswith(prefix):
+                                code_str = code_str[len(prefix):]
+                                break
+                        digits = ''.join(filter(str.isdigit, code_str))
+                        if len(digits) == 6:
+                            return digits.zfill(6)
+                    return None
+
+                industry_df_cleaned['股票代码'] = industry_df_cleaned.apply(generate_pure_code, axis=1)
+
+                # 重命名映射
+                rename_dict = {}
+                if 'name' in industry_df_cleaned.columns:
+                    rename_dict['name'] = '股票简称'
+                if 'industry' in industry_df_cleaned.columns:
+                    rename_dict['industry'] = '行业'
+
+                industry_df_cleaned = industry_df_cleaned.rename(columns=rename_dict)
+
+                # 确保必要列存在
+                if '股票简称' not in industry_df_cleaned.columns:
+                    industry_df_cleaned['股票简称'] = 'N/A'
+                if '行业' not in industry_df_cleaned.columns:
+                    industry_df_cleaned['行业'] = 'N/A'
+
+                # 过滤无效代码并去重
+                industry_df_cleaned = industry_df_cleaned[
+                    industry_df_cleaned['股票代码'].notnull() &
+                    (industry_df_cleaned['股票代码'].str.len() == 6)
+                    ].copy()
+
+                # 与输入代码列表做 Inner Join
+                input_df_codes = pd.DataFrame(codes_pure_digits, columns=['股票代码'])
+                input_df_codes['股票代码'] = input_df_codes['股票代码'].astype(str).str.zfill(6)
+
+                final_industry_df = pd.merge(
+                    input_df_codes,
+                    industry_df_cleaned[['股票代码', '行业', '股票简称']],
+                    on='股票代码',
+                    how='left'
+                )
+
+                # 填充合并后产生的 NaN
+                final_industry_df['行业'] = final_industry_df['行业'].fillna('N/A')
+                final_industry_df['股票简称'] = final_industry_df['股票简称'].fillna('N/A')
+
+                # 输出统计
+                valid_count = final_industry_df[final_industry_df['行业'] != 'N/A'].shape[0]
+                self.logger.info(f"行业数据加载完成：总共 {len(codes_pure_digits)} 只股票，成功匹配 {valid_count} 只。")
+
+                # 确保最终返回的是清洗后的 DataFrame
+                return final_industry_df
+
+            except Exception as e:
+                # 如果清洗逻辑出错，记录错误并返回默认空 DataFrame
+                self.logger.error(f"清洗行业信息数据时发生错误: {e}")
+                return default_return_df
 
         except Exception as e:
             self.logger.error(f"从数据库读取行业信息失败: {e}，将尝试回退到空数据。")
-            return pd.DataFrame(columns=['股票代码', '行业', '股票简称'])
+            return default_return_df
 
     def _get_all_raw_data(self) -> Dict[str, pd.DataFrame]:
         """集中获取所有数据源 (包括主力研报盈利预测)，并支持缓存机制"""
@@ -507,6 +595,10 @@ class StockAnalyzer:
         spot_df = processed_data.get('spot_data_all', pd.DataFrame())
         file_industry_df = processed_data.get('individual_industry', pd.DataFrame())
 
+        if file_industry_df is None or not isinstance(file_industry_df, pd.DataFrame):
+            self.logger.warning("[WARN] 获取的 industry_df 是 None 或非 DataFrame 类型，使用空 DataFrame 替代。")
+            file_industry_df = pd.DataFrame(columns=['股票代码', '股票简称'])  # 使用必要的列初始化
+
         if '股票代码' in spot_df.columns:
             spot_df['股票代码'] = spot_df['股票代码'].astype(str)
 
@@ -515,6 +607,17 @@ class StockAnalyzer:
 
         all_names = pd.concat([name_source_spot, file_industry_df[['股票代码', '股票简称']]]).drop_duplicates(
             # 调整 concat
+            subset=['股票代码'], keep='first')
+
+        required_cols = ['股票代码', '股票简称']
+        missing_cols = [col for col in required_cols if col not in file_industry_df.columns]
+        if missing_cols:
+            self.logger.warning(f"[WARN] industry_df 缺少列: {missing_cols}，将填充为 N/A。")
+            for col in missing_cols:
+                file_industry_df[col] = 'N/A'
+
+        # 现在再执行 concat
+        all_names = pd.concat([name_source_spot, file_industry_df[required_cols]]).drop_duplicates(
             subset=['股票代码'], keep='first')
         final_df = pd.merge(final_df, all_names, on='股票代码', how='left')
 
