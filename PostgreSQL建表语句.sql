@@ -16,3 +16,16 @@ CREATE INDEX idx_ind_date ON ods_ak_industry_analysis USING btree (archive_date)
 -- ods_ak_ranking_stocks definition
 CREATE TABLE ods_ak_ranking_stocks ( id int4 NOT NULL, archive_date date NOT NULL, strategy_type varchar(50) NOT NULL, stock_code varchar(20) NOT NULL, stock_name varchar(50) NULL, feature_value numeric(10, 2) NULL, description text NULL, created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL, CONSTRAINT ods_ak_strategy_stocks_combined_pkey PRIMARY KEY (archive_date, strategy_type, stock_code));
 CREATE INDEX idx_stock_code_lookup ON ods_ak_ranking_stocks USING btree (stock_code);
+
+
+-- stock_basic_info definition
+CREATE TABLE public.stock_basic_info ( id serial4 NOT NULL, ts_code varchar(20) NOT NULL, symbol varchar(10) NULL, "name" varchar(100) NULL, industry varchar(50) NULL, market varchar(20) NULL, create_time timestamp NULL, CONSTRAINT stock_basic_info_pkey PRIMARY KEY (id), CONSTRAINT stock_basic_info_ts_code_key UNIQUE (ts_code));
+CREATE INDEX idx_stock_basic_industry ON public.stock_basic_info USING btree (industry);
+CREATE INDEX idx_stock_basic_market ON public.stock_basic_info USING btree (market);
+CREATE INDEX idx_stock_basic_name ON public.stock_basic_info USING btree (name);
+CREATE INDEX idx_stock_basic_symbol ON public.stock_basic_info USING btree (symbol);
+CREATE INDEX idx_stock_basic_ts_code ON public.stock_basic_info USING btree (ts_code);
+create trigger update_stock_basic_info_modtime before
+update
+    on
+    public.stock_basic_info for each row execute function update_modified_column();
