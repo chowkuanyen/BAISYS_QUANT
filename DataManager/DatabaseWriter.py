@@ -1,5 +1,4 @@
 import urllib.parse
-
 import pandas as pd
 from sqlalchemy import create_engine, text
 import io
@@ -66,7 +65,7 @@ class QuantDBManager:
         内部方法：利用 PostgreSQL 的 COPY 协议实现秒级入库
         """
         output = io.StringIO()
-        df.to_csv(output, sep='\t', header=False, index=False,encoding='utf-8')
+        df.to_csv(output, sep='\t', header=False, index=False, encoding='utf-8')
         output.seek(0)
 
         raw_conn = self.engine.raw_connection()
@@ -92,3 +91,87 @@ class QuantDBManager:
         if self.engine:
             self.engine.dispose()
             print("  - [数据库] 连接池已释放。")
+
+    def execute_query(self, query: str, params=None):
+        """执行查询语句"""
+        with self.engine.connect() as conn:
+            if params:
+                result = conn.execute(text(query), params)
+            else:
+                result = conn.execute(text(query))
+            return result.fetchall()
+
+    def execute_update(self, query: str, params=None):
+        """执行更新语句"""
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                if params:
+                    result = conn.execute(text(query), params)
+                else:
+                    result = conn.execute(text(query))
+                trans.commit()
+                return result.rowcount
+            except Exception as e:
+                trans.rollback()
+                raise e
+
+    def execute_many(self, query: str, values_list):
+        """批量执行SQL语句"""
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                result = conn.execute(text(query), values_list)
+                trans.commit()
+                return result.rowcount
+            except Exception as e:
+                trans.rollback()
+                raise e
+
+    def get_table_count(self, table_name: str):
+        """获取表记录数"""
+        query = f"SELECT COUNT(*) FROM {table_name}"
+        result = self.execute_query(query)
+        return result[0][0] if result else 0
+
+    def get_latest_record_date(self, table_name: str, date_column: str) -> str:
+        """获取表中指定日期列的最新日期值"""
+        query = f"""
+        SELECT TO_CHAR({date_column}, 'YYYYMMDD') as latest_date 
+        FROM {table_name} 
+        ORDER BY {date_column} DESC 
+        LIMIT 1
+        """
+        result = self.execute_query(query)
+        if result and len(result) > 0:
+            return str(result[0][0]) if result[0][0] else ""
+        else:
+            return ""
+
+    def check_table_exists(self, table_name: str) -> bool:
+        """检查表是否存在"""
+        query = """
+        SELECT EXISTS (
+           SELECT FROM information_schema.tables 
+           WHERE table_schema = 'public' 
+           AND table_name = :table_name
+        );
+        """
+        result = self.execute_query(query, {"table_name": table_name})
+        return result[0][0] if result else False
+
+    def get_table_columns(self, table_name: str) -> list:
+        """获取表的所有列名"""
+        query = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = :table_name
+        ORDER BY ordinal_position;
+        """
+        result = self.execute_query(query, {"table_name": table_name})
+        return [row[0] for row in result] if result else []
+
+    def truncate_table(self, table_name: str):
+        """清空表数据"""
+        query = f"TRUNCATE TABLE {table_name};"
+        return self.execute_update(query)
