@@ -6,12 +6,12 @@ from typing import List, Dict, Tuple, Optional
 import warnings
 import os
 from pathlib import Path
-import akshare as ak
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from tqdm import tqdm
 import time
 import logging
+import configparser
 
 warnings.filterwarnings('ignore')
 
@@ -19,29 +19,185 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+class Config:
+    def __init__(self, config_file: str = "../config.ini"):
+        self.config_file = config_file
+        self._validate_config_file()
+        self._load_config()
+        self._ensure_directories()
+
+    def _validate_config_file(self):
+        if not os.path.exists(self.config_file):
+            raise FileNotFoundError(f"配置文件未找到: {os.path.abspath(self.config_file)}")
+
+    def _load_config(self):
+        config = configparser.ConfigParser()
+        config.read(self.config_file, encoding='utf-8')
+
+        # 读取数据库配置
+        db = config['DATABASE']
+        self.DB_USER = db.get('user')
+        self.DB_PASSWORD = db.get('password')
+        self.DB_HOST = db.get('host')
+        self.DB_PORT = db.get('port')
+        self.DB_NAME = db.get('db_name')
+
+        # 读取 SYSTEM 配置
+        system = config['SYSTEM']
+        home_dir = system.get('HOME_DIRECTORY', '~/Downloads/CoreNews_Reports')
+        self.HOME_DIRECTORY = os.path.expanduser(home_dir)
+        temp_dir = system.get('TEMP_DATA_DIR', 'ShareData')
+        self.TEMP_DATA_DIRECTORY = os.path.join(self.HOME_DIRECTORY, temp_dir)
+
+        self.MAX_WORKERS = system.getint('MAX_WORKERS', fallback=15)
+        self.DATA_FETCH_RETRIES = system.getint('DATA_FETCH_RETRIES', fallback=3)
+        self.DATA_FETCH_DELAY = system.getint('DATA_FETCH_DELAY', fallback=5)
+
+        # 其他配置...
+        self.CODE_ALIASES = {'代码': '股票代码', '证券代码': '股票代码', '股票代码': '股票代码'}
+        self.NAME_ALIASES = {'名称': '股票简称', '股票名称': '股票简称', '股票简称': '股票简称', '简称': '股票简称'}
+        self.PRICE_ALIASES = {'最新价': '最新价', '现价': '最新价', '当前价格': '最新价', '今收盘': '最新价',
+                              '收盘': '最新价', '收盘价': '最新价'}
+
+        self.TUSHARE_TOKEN = db.get('tushare_token')  # 如果没有配置，默认为 None
+        if not self.TUSHARE_TOKEN:
+            raise ValueError("配置文件中缺少 'tushare_token'，请在 [DATABASE] 节点下添加。")
+
+        log = config['LOGGING']
+        self.LOG_LEVEL = log.get('LOG_LEVEL', 'INFO')
+        self.LOG_DIR = os.path.join(self.HOME_DIRECTORY, log.get('LOG_DIR', 'Logs'))
+
+        for key, val in self.__dict__.items():
+            if val is None:
+                raise ValueError(f"配置项 '{key}' 未设置，请在 {self.config_file} 中检查。")
+
+    def _ensure_directories(self):
+        dirs = [self.HOME_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR]
+        for d in dirs:
+            os.makedirs(d, exist_ok=True)
+
+    def get_db_connection_string(self) -> str:
+        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+
+class StockOpportunityAnalyzer:
+    """
+    股票操作机会时效性分析工具
+    专门分析技术信号的有效期和最佳操作窗口
+    """
+
+    def __init__(self):
+        self.current_date = datetime.now()
+
+    def calculate_opportunity_window(self, signal_date: datetime, signal_strength: str, volume_score: int,
+                                     breakout_amplify: bool, valley_shrink: bool, sell_signals_count: int) -> Dict:
+        """
+        计算操作窗口期
+        """
+        days_since_signal = (self.current_date - signal_date).days
+
+        # 基于信号强度计算有效期
+        base_validity = 20  # 基础有效期20天
+
+        # 根据信号特征调整有效期
+        validity_adjustment = 0
+        if signal_strength == 'strong':
+            validity_adjustment += 5  # 强信号增加5天
+        if volume_score >= 70:
+            validity_adjustment += 3  # 高量能分数增加3天
+        if breakout_amplify:
+            validity_adjustment += 2  # 突破放量增加2天
+        if valley_shrink:
+            validity_adjustment += 2  # 底部缩量增加2天
+        if sell_signals_count == 0:
+            validity_adjustment += 3  # 无卖出信号增加3天
+        else:
+            validity_adjustment -= sell_signals_count * 2  # 每个卖出信号减少2天
+
+        adjusted_validity = base_validity + validity_adjustment
+        adjusted_validity = max(5, min(60, adjusted_validity))  # 限制在5-60天
+
+        # 计算剩余有效时间
+        remaining_time = max(0, adjusted_validity - days_since_signal)
+
+        # 计算机会衰减率
+        decay_rate = min(1.0, days_since_signal / adjusted_validity)
+        opportunity_score = max(0, 100 * (1 - decay_rate))
+
+        # 操作紧迫性评估
+        urgency_level = self._assess_urgency(days_since_signal, remaining_time, adjusted_validity)
+
+        return {
+            'base_validity_days': base_validity,
+            'adjusted_validity_days': adjusted_validity,
+            'days_since_signal': days_since_signal,
+            'remaining_validity_days': remaining_time,
+            'opportunity_score': opportunity_score,
+            'decay_rate': decay_rate,
+            'urgency_level': urgency_level,
+            'valid_until': signal_date + timedelta(days=adjusted_validity),
+            'signal_age_category': self._categorize_signal_age(days_since_signal)
+        }
+
+    def _assess_urgency(self, days_since_signal: int, remaining_time: int, total_validity: int) -> str:
+        """
+        评估操作紧迫性
+        """
+        if remaining_time <= 0:
+            return "已过期"
+        elif remaining_time <= 3:
+            return "紧急"
+        elif remaining_time <= 7:
+            return "较高"
+        elif remaining_time <= 14:
+            return "中等"
+        else:
+            return "较低"
+
+    def _categorize_signal_age(self, days_since_signal: int) -> str:
+        """
+        分类信号年龄
+        """
+        if days_since_signal <= 3:
+            return "新鲜信号"
+        elif days_since_signal <= 7:
+            return "近期信号"
+        elif days_since_signal <= 14:
+            return "中期信号"
+        elif days_since_signal <= 30:
+            return "较老信号"
+        else:
+            return "陈旧信号"
+
+
 class MACDKDJDoubleBottomAnalyzer:
     """
-    MACD+KDJ双重谷形态量化分析程序
+    MACD+KDJ双重谷形态量化分析程序 (增强版：含量能分析和时效性分析)
     仅统计最近30个交易日内进入第二个谷的形态
     并计算当天股票价格在双谷趋势中的相对状态
     新增功能：计算颈线位置及当前股价与颈线的相对差值
     ST股票过滤：含有ST前缀或st的股票直接过滤，不参与计算
     KDJ信号识别优化：不再打印K/D/J数值，改为识别30天内的KDJ信号
     多线程并行处理：使用8个线程同时分析不同股票
+    买卖建议：根据信号强度和风险因素提供买入/卖出/观望建议
+    量能指标：验证底部缩量和颈线突破放量
+    时效性分析：评估信号的有效期和操作窗口
     """
 
-    def __init__(self, connection_string: str, max_retries: int = 3):
+    def __init__(self, config: Config, max_retries: int = 3):
         """
         初始化分析器
 
         Args:
-            connection_string: PostgreSQL数据库连接字符串
+            config: 配置对象
             max_retries: 数据库连接最大重试次数
         """
-        self.connection_string = connection_string
+        self.config = config
+        self.connection_string = config.get_db_connection_string()
         self.max_retries = max_retries
         self.conn = None
         self.lock = threading.Lock()  # 用于多线程安全的数据库连接
+        self.opportunity_analyzer = StockOpportunityAnalyzer()  # 新增：时效性分析器
 
     def connect_database(self, force_new: bool = False):
         """
@@ -96,9 +252,9 @@ class MACDKDJDoubleBottomAnalyzer:
                     if not self.conn:
                         self.connect_database()
 
-                    # 构建SQL查询
+                    # 构建SQL查询 (使用 amount 替代 vol)
                     query = f"""
-                    SELECT trade_date, symbol, "open", "close", high, low, close_normal, adj_ratio
+                    SELECT trade_date, symbol, "open", "close", high, low, amount, close_normal, adj_ratio
                     FROM stock_daily_kline
                     WHERE symbol = '{symbol}'
                     """
@@ -113,6 +269,9 @@ class MACDKDJDoubleBottomAnalyzer:
                     df = pd.read_sql_query(query, self.conn)
                     df['trade_date'] = pd.to_datetime(df['trade_date'])
                     df = df.sort_values('trade_date').reset_index(drop=True)
+
+                    # 重命名 amount 列为 vol 以保持一致性
+                    df.rename(columns={'amount': 'vol'}, inplace=True)
 
                     return df
             except Exception as e:
@@ -176,7 +335,7 @@ class MACDKDJDoubleBottomAnalyzer:
 
     def get_stock_name(self, symbol: str) -> str:
         """
-        根据股票代码获取股票简称
+        根据股票代码从数据库获取股票简称
 
         Args:
             symbol: 股票代码，如 sh603233
@@ -185,14 +344,22 @@ class MACDKDJDoubleBottomAnalyzer:
             股票简称
         """
         try:
-            # 去掉前缀获取纯股票代码
-            code = symbol[2:]  # 去掉SH或SZ前缀
-            info_df = ak.stock_individual_info_em(symbol=code)
+            with self.lock:  # 确保线程安全
+                if not self.conn:
+                    self.connect_database()
 
-            # 查找股票简称
-            name_row = info_df[info_df['item'] == '股票简称']
-            if not name_row.empty:
-                return name_row['value'].iloc[0]
+            # 构建SQL查询，从stock_basic_info表获取股票名称
+            query = f"""
+            SELECT "name"
+            FROM stock_basic_info
+            WHERE symbol = '{symbol[2:]}' OR ts_code = '{symbol}'
+            LIMIT 1
+            """
+
+            df = pd.read_sql_query(query, self.conn)
+
+            if not df.empty and not pd.isna(df['name'].iloc[0]):
+                return df['name'].iloc[0]
             else:
                 return "未知"
         except Exception as e:
@@ -352,7 +519,8 @@ class MACDKDJDoubleBottomAnalyzer:
                         'type': '低位超卖金叉',
                         'date': date,
                         'description': f'K上穿D，K={k:.2f}, D={d:.2f}',
-                        'strength': 'strong'
+                        'strength': 'strong',
+                        'signal_type': 'buy'  # 买入信号
                     })
                 # 检查J线反转
                 elif prev_j <= 10 and j > 10:  # J线从极低位回升
@@ -360,7 +528,8 @@ class MACDKDJDoubleBottomAnalyzer:
                         'type': '极值J线反转',
                         'date': date,
                         'description': f'J线从{prev_j:.2f}反转至{j:.2f}',
-                        'strength': 'moderate'
+                        'strength': 'moderate',
+                        'signal_type': 'buy'  # 买入信号
                     })
             elif k <= 30 and d <= 30:  # 弱超卖区域
                 if prev_k <= prev_d and k > d:  # K上穿D
@@ -368,7 +537,8 @@ class MACDKDJDoubleBottomAnalyzer:
                         'type': '弱位金叉',
                         'date': date,
                         'description': f'K上穿D，K={k:.2f}, D={d:.2f}',
-                        'strength': 'moderate'
+                        'strength': 'moderate',
+                        'signal_type': 'buy'  # 买入信号
                     })
             elif k >= 70 and d >= 70 and j >= 80:  # 超买区域
                 # 检查死叉信号
@@ -377,7 +547,8 @@ class MACDKDJDoubleBottomAnalyzer:
                         'type': '高位超买死叉',
                         'date': date,
                         'description': f'K下穿D，K={k:.2f}, D={d:.2f}',
-                        'strength': 'strong'
+                        'strength': 'strong',
+                        'signal_type': 'sell'  # 卖出信号
                     })
             elif k >= 80 and j >= 100:  # 极值J线
                 if prev_j >= 100 and j < 100:  # J线从极高位回落
@@ -385,7 +556,8 @@ class MACDKDJDoubleBottomAnalyzer:
                         'type': '极值J线反转',
                         'date': date,
                         'description': f'J线从{prev_j:.2f}反转至{j:.2f}',
-                        'strength': 'moderate'
+                        'strength': 'moderate',
+                        'signal_type': 'sell'  # 卖出信号
                     })
             # 检查趋势确认金叉（K/D均在50附近，K上穿D）
             elif 40 <= k <= 60 and 40 <= d <= 60 and prev_k <= prev_d and k > d:
@@ -393,7 +565,8 @@ class MACDKDJDoubleBottomAnalyzer:
                     'type': '趋势确认金叉',
                     'date': date,
                     'description': f'K在50附近上穿D，K={k:.2f}, D={d:.2f}',
-                    'strength': 'moderate'
+                    'strength': 'moderate',
+                    'signal_type': 'buy'  # 买入信号
                 })
 
         # 去重，保留每个日期的第一个信号
@@ -405,6 +578,62 @@ class MACDKDJDoubleBottomAnalyzer:
                 seen_dates.add(signal['date'])
 
         return unique_signals
+
+    # --- 新增：量能分析核心方法 ---
+    def analyze_volume(self, df: pd.DataFrame, valley1_idx: int, valley2_idx: int, convergence_idx: int) -> Dict:
+        """
+        分析双底形态的量能情况，验证真实性
+
+        Args:
+            df: 包含股票数据的DataFrame (含vol列)
+            valley1_idx: 第一个谷的索引
+            valley2_idx: 第二个谷的索引
+            convergence_idx: 形态收敛/信号确认的索引
+
+        Returns:
+            量能分析结果字典
+        """
+        volume_analysis = {
+            'is_valley_shrink': False,  # 底部是否缩量
+            'is_breakout_amplify': False,  # 突破是否放量
+            'volume_score': 50  # 量能综合得分 (0-100)
+        }
+
+        # 1. 检查谷底缩量
+        # 取谷底前后3天的平均成交量，避免单日异常
+        window = 3
+        v1_start = max(0, valley1_idx - window)
+        v1_end = min(len(df), valley1_idx + window)
+        v2_start = max(0, valley2_idx - window)
+        v2_end = min(len(df), valley2_idx + window)
+
+        avg_vol_v1 = df['vol'][v1_start:v1_end].mean()
+        avg_vol_v2 = df['vol'][v2_start:v2_end].mean()
+
+        if avg_vol_v1 > 0 and avg_vol_v2 > 0:
+            # 谷2成交量小于谷1的70%，视为缩量
+            if avg_vol_v2 < avg_vol_v1 * 0.7:
+                volume_analysis['is_valley_shrink'] = True
+                volume_analysis['volume_score'] += 20  # 缩量是好现象，加分
+
+        # 2. 检查颈线突破放量
+        if convergence_idx < len(df) and convergence_idx > 0:
+            conv_vol = df['vol'].iloc[convergence_idx]
+            # 计算突破前5日均量
+            pre_5d_avg_vol = df['vol'].iloc[max(0, convergence_idx - 5):convergence_idx].mean()
+
+            if pre_5d_avg_vol > 0:
+                # 突破日成交量是前5日均量的1.5倍以上，视为放量
+                if conv_vol > pre_5d_avg_vol * 1.5:
+                    volume_analysis['is_breakout_amplify'] = True
+                    volume_analysis['volume_score'] += 30  # 放量是关键，加更多分
+
+        # 3. 综合评分，上限100
+        volume_analysis['volume_score'] = min(volume_analysis['volume_score'], 100)
+
+        return volume_analysis
+
+    # ---
 
     def calculate_neckline(self, df: pd.DataFrame, valley1_idx: int, valley2_idx: int, peak_between_idx: int) -> Dict:
         """
@@ -440,8 +669,6 @@ class MACDKDJDoubleBottomAnalyzer:
             'neckline_price': round(neckline_price, 2),
             'current_price': round(current_price, 2),
             'neck_diff': round(neck_diff, 2),
-            'is_neckline_breakout': is_breakout,
-            'neckline_status': '突破' if is_breakout else '未突破',
             'breakout_strength': '强突破' if neck_diff > 0.05 * neckline_price else (
                 '弱突破' if neck_diff > 0 else '未突破')
         }
@@ -478,7 +705,7 @@ class MACDKDJDoubleBottomAnalyzer:
 
         # 计算价格恢复程度（相对于最低谷的恢复比例）
         recovery_rate = (current_close - min_valley_price) / (
-                    max(valley1_close, valley2_close) - min_valley_price) * 100
+                max(valley1_close, valley2_close) - min_valley_price) * 100
 
         # 判断当前价格状态
         if current_close <= min_valley_price:
@@ -499,6 +726,64 @@ class MACDKDJDoubleBottomAnalyzer:
             'valley1_price': round(valley1_close, 2),
             'valley2_price': round(valley2_close, 2)
         }
+
+    def generate_trade_recommendation(self, signal_info: Dict) -> str:
+        """
+        根据信号信息生成买卖建议
+
+        Args:
+            signal_info: 信号信息字典
+
+        Returns:
+            买卖建议字符串
+        """
+        # 获取关键指标
+        signal_strength = signal_info.get('signal_strength', 'weak')
+        neckline_breakout = signal_info.get('neckline_info', {}).get('breakout_strength', '未突破') != '未突破'
+        sell_signals_count = signal_info.get('sell_signals_count', 0)
+        price_recovery_rate = signal_info.get('price_relative_status', {}).get('price_recovery_rate', 0)
+        current_ma60_slope = signal_info.get('current_ma60_slope', 0)
+        # --- 新增：获取量能分数 ---
+        volume_score = signal_info.get('volume_score', 50)
+
+        # 基础判断逻辑
+        base_recommendation = '观望'
+        if signal_strength == 'strong' and neckline_breakout and current_ma60_slope > 0:
+            if sell_signals_count == 0:
+                base_recommendation = '强烈买入'
+            elif sell_signals_count == 1:
+                base_recommendation = '谨慎买入'
+            else:
+                base_recommendation = '观望'
+        elif signal_strength == 'strong' and neckline_breakout:
+            if sell_signals_count == 0:
+                base_recommendation = '买入'
+            elif sell_signals_count == 1:
+                base_recommendation = '谨慎买入'
+            else:
+                base_recommendation = '观望'
+        elif signal_strength == 'strong':
+            if sell_signals_count == 0:
+                base_recommendation = '潜在买入'
+            else:
+                base_recommendation = '观望'
+        elif signal_strength == 'weak':
+            if sell_signals_count == 0:
+                base_recommendation = '轻仓试探'
+            else:
+                base_recommendation = '观望'
+
+        # --- 优化：根据量能分数调整建议 ---
+        # 如果基础建议是积极的，但量能不佳，则降级
+        if base_recommendation in ['强烈买入', '买入', '潜在买入', '谨慎买入'] and volume_score < 50:
+            if volume_score < 30:
+                return '量能不足-观望'
+            else:
+                return '量能一般-谨慎'
+        elif base_recommendation in ['强烈买入', '买入'] and volume_score < 70:
+            return '量能尚可-买入'  # 介于中间的评价
+
+        return base_recommendation
 
     def detect_recent_double_bottom_pattern(self, df: pd.DataFrame, recent_days: int = 30) -> List[Dict]:
         """
@@ -592,10 +877,17 @@ class MACDKDJDoubleBottomAnalyzer:
                         kdj_low_and_rising = (k_current < 30 and k_current > k_prev) and \
                                              (d_current < 30 and d_current > d_prev)
 
+                        # 检查是否存在高位死叉信号（作为风险警示）
+                        has_high_sell_signal = any(
+                            sig['signal_type'] == 'sell' and sig['date'] == df.iloc[j]['trade_date'].date()
+                            for sig in self.detect_kdj_signals(df.loc[:j])
+                        )
+
                         # 检查MA60方向是否向上
                         ma60_slope = df['MA60_slope'].iloc[j] if j < len(df) else 0
 
                         # 只有当MACD金叉 + KDJ共振 + MA60方向向上时才确认信号
+                        # 同时记录是否存在高位死叉信号
                         if (kdj_bullish or kdj_low_and_rising) and ma60_slope > 0:
                             signal_found = True
                             signal_idx = j
@@ -625,10 +917,17 @@ class MACDKDJDoubleBottomAnalyzer:
                         kdj_low_and_rising = (k_current < 30 and k_current > k_prev) and \
                                              (d_current < 30 and d_current > d_prev)
 
+                        # 检查是否存在高位死叉信号（作为风险警示）
+                        has_high_sell_signal = any(
+                            sig['signal_type'] == 'sell' and sig['date'] == df.iloc[j]['trade_date'].date()
+                            for sig in self.detect_kdj_signals(df.loc[:j])
+                        )
+
                         # 检查MA60方向是否向上
                         ma60_slope = df['MA60_slope'].iloc[j] if j < len(df) else 0
 
                         # 只有当BAR转正 + KDJ共振 + MA60方向向上时才确认信号
+                        # 同时记录是否存在高位死叉信号
                         if (kdj_bullish or kdj_low_and_rising) and ma60_slope > 0:
                             signal_found = True
                             signal_idx = j
@@ -644,6 +943,25 @@ class MACDKDJDoubleBottomAnalyzer:
 
                 # 检测KDJ信号
                 kdj_signals = self.detect_kdj_signals(df, lookback_days=30)
+
+                # 统计卖出信号数量
+                sell_signals_count = sum(1 for sig in kdj_signals if sig['signal_type'] == 'sell')
+
+                # --- 新增：量能分析 ---
+                volume_analysis = self.analyze_volume(df, valley1_idx, valley2_idx, signal_idx)
+                # ---
+
+                # --- 新增：时效性分析 ---
+                signal_datetime = datetime.combine(signal_date, datetime.min.time())
+                opportunity_info = self.opportunity_analyzer.calculate_opportunity_window(
+                    signal_datetime,
+                    'strong',
+                    volume_analysis['volume_score'],
+                    volume_analysis['is_breakout_amplify'],
+                    volume_analysis['is_valley_shrink'],
+                    sell_signals_count
+                )
+                # ---
 
                 pattern_info = {
                     'valley1_date': df.iloc[valley1_idx]['trade_date'].date(),
@@ -663,7 +981,17 @@ class MACDKDJDoubleBottomAnalyzer:
                     'signal_strength': 'strong',
                     'price_relative_status': price_status,
                     'neckline_info': neckline_info,
-                    'kdj_signals': kdj_signals
+                    'kdj_signals': kdj_signals,
+                    'sell_signals_count': sell_signals_count,
+                    'risk_level': '高' if sell_signals_count > 0 else '低',
+                    # --- 新增字段 ---
+                    'volume_analysis': volume_analysis,
+                    'volume_score': volume_analysis['volume_score'],
+                    'is_valley_shrink': volume_analysis['is_valley_shrink'],
+                    'is_breakout_amplify': volume_analysis['is_breakout_amplify'],
+                    # --- 新增：时效性字段 ---
+                    'opportunity_info': opportunity_info
+                    # ---
                 }
 
                 patterns.append(pattern_info)
@@ -740,13 +1068,13 @@ class MACDKDJDoubleBottomAnalyzer:
 
 def main():
     """
-    主函数 - 全市场扫描MACD+KDJ双重谷形态（多线程版本）
+    主函数 - 全市场扫描MACD+KDJ双重谷形态（多线程版本，含时效性分析）
     """
-    # 数据库连接字符串（请替换为实际的连接字符串）
-    connection_string = "postgresql://postgres:025874yan@localhost:5432/Corenews"
+    # 从上级目录加载配置文件
+    config = Config("../config.ini")
 
     # 创建分析器实例
-    analyzer = MACDKDJDoubleBottomAnalyzer(connection_string, max_retries=3)
+    analyzer = MACDKDJDoubleBottomAnalyzer(config, max_retries=3)
 
     print("开始全市场MACD+KDJ双重谷形态扫描...")
     print("扫描条件：仅统计最近30个交易日内进入第二个谷的形态")
@@ -754,9 +1082,13 @@ def main():
     print("信号确认：等待MACD金叉/KDJ共振后再确认信号")
     print("新增功能：计算颈线位置及当前股价与颈线的相对差值")
     print("ST股票过滤：含有ST前缀或st的股票直接过滤，不参与计算")
-    print("KDJ信号识别优化：识别30天内的KDJ信号，不再显示具体K/D/J数值")
+    print("KDJ信号识别优化：识别30天内的KDJ信号，包括买入和卖出信号")
+    print("风险提示：保留高位超买死叉信号作为风险警示")
     print("多线程处理：使用8个线程并行分析不同股票")
     print("改进：添加数据库连接重试机制，防止连接异常中断")
+    print("买卖建议：根据信号强度和风险因素提供买入/卖出/观望建议")
+    print("量能指标：验证底部缩量和颈线突破放量")
+    print("时效性分析：评估信号的有效期和操作窗口")
 
     # 获取所有股票代码
     all_symbols = analyzer.get_all_symbols()
@@ -815,6 +1147,8 @@ def main():
 
     # 生成买入信号
     buy_signals = []
+    risk_signals = []  # 存储带风险警示的信号
+
     for symbol, result in results.items():
         # 跳过ST股票的结果
         if result.get('is_st_stock', False) or result.get('skipped', False):
@@ -833,6 +1167,18 @@ def main():
                     latest_kdj_signal = pattern['kdj_signals'][-1]['type']
                     latest_kdj_signal_date = pattern['kdj_signals'][-1]['date']
 
+                # 生成买卖建议
+                trade_recommendation = analyzer.generate_trade_recommendation({
+                    'signal_strength': pattern['signal_strength'],
+                    'neckline_info': pattern['neckline_info'],
+                    'sell_signals_count': pattern['sell_signals_count'],
+                    'price_relative_status': pattern['price_relative_status'],
+                    'current_ma60_slope': result['latest_ma60_slope'],
+                    # --- 新增：传递量能信息 ---
+                    'volume_score': pattern['volume_score']
+                    # ---
+                })
+
                 signal = {
                     'symbol': symbol,
                     'stock_name': stock_name,
@@ -847,22 +1193,60 @@ def main():
                     'kdj_signal': latest_kdj_signal or '无信号',
                     'kdj_signal_date': latest_kdj_signal_date or '无信号',
                     'price_relative_status': pattern['price_relative_status'],
-                    'neckline_info': pattern['neckline_info']
+                    'neckline_info': pattern['neckline_info'],
+                    'sell_signals_count': pattern['sell_signals_count'],
+                    'risk_level': pattern['risk_level'],
+                    'has_risk_warning': pattern['sell_signals_count'] > 0,
+                    'trade_recommendation': trade_recommendation,
+                    # --- 新增字段 ---
+                    'volume_score': pattern['volume_score'],
+                    'is_valley_shrink': pattern['is_valley_shrink'],
+                    'is_breakout_amplify': pattern['is_breakout_amplify'],
+                    # --- 新增：时效性字段 ---
+                    'opportunity_info': pattern['opportunity_info']
+                    # ---
                 }
 
                 buy_signals.append(signal)
 
+                # 如果存在风险信号，也加入风险信号列表
+                if signal['has_risk_warning']:
+                    risk_signals.append(signal)
+
     print(f"总买入信号数: {len(buy_signals)}")
+    print(f"带风险警示的信号数: {len(risk_signals)}")
 
     if buy_signals:
         print(f"\n=== 买入信号详情 ===")
+
+        # 按风险等级分组
+        high_risk_signals = [s for s in buy_signals if s['risk_level'] == '高']
+        low_risk_signals = [s for s in buy_signals if s['risk_level'] == '低']
+
+        print(f"高风险信号数量: {len(high_risk_signals)}")
+        print(f"低风险信号数量: {len(low_risk_signals)}")
+
+        # 按买卖建议分组
+        recommendation_groups = {}
+        for signal in buy_signals:
+            rec = signal['trade_recommendation']
+            if rec not in recommendation_groups:
+                recommendation_groups[rec] = []
+            recommendation_groups[rec].append(signal)
+
+        print(f"\n按买卖建议分组:")
+        for rec, signals in recommendation_groups.items():
+            print(f"  {rec}: {len(signals)}个")
+
         for i, signal in enumerate(buy_signals):
             neckline_info = signal['neckline_info']
             price_status = signal['price_relative_status']
+            opportunity_info = signal['opportunity_info']
 
             print(f"\n信号 {i + 1}:")
             print(f"  股票代码: {signal['symbol']}")
             print(f"  股票简称: {signal['stock_name']}")
+            print(f"  买卖建议: {signal['trade_recommendation']}")
             print(f"  信号日期: {signal['signal_date']}")
             print(f"  信号强度: {signal['signal_strength']}")
             print(f"  MA60方向: {signal['ma60_direction']}")
@@ -870,11 +1254,24 @@ def main():
             print(f"  KDJ信号: {signal['kdj_signal']}")
             print(f"  KDJ信号日期: {signal['kdj_signal_date']}")
             print(f"  颈线价格: {neckline_info['neckline_price']}")
-            print(f"  颈线突破状态: {neckline_info['neckline_status']}")
             print(f"  颈线突破差值: {neckline_info['neck_diff']}")
             print(f"  颈线突破强度: {neckline_info['breakout_strength']}")
             print(f"  价格状态: {price_status['status_description']}")
             print(f"  价格恢复度: {price_status['price_recovery_rate']}%")
+            print(f"  风险等级: {signal['risk_level']}")
+            print(f"  高位死叉信号数: {signal['sell_signals_count']}")
+            # --- 新增：打印量能信息 ---
+            print(f"  量能评分: {signal['volume_score']}")
+            print(f"  底部缩量: {'是' if signal['is_valley_shrink'] else '否'}")
+            print(f"  突破放量: {'是' if signal['is_breakout_amplify'] else '否'}")
+            # --- 新增：打印时效性信息 ---
+            print(f"  信号年龄: {opportunity_info['days_since_signal']}天")
+            print(f"  信号年龄类别: {opportunity_info['signal_age_category']}")
+            print(f"  调整后有效期: {opportunity_info['adjusted_validity_days']}天")
+            print(f"  剩余有效期: {opportunity_info['remaining_validity_days']}天")
+            print(f"  机会得分: {opportunity_info['opportunity_score']:.1f}/100")
+            print(f"  操作紧迫性: {opportunity_info['urgency_level']}")
+            # ---
 
         # 按信号强度分类
         strong_signals = [s for s in buy_signals if s['signal_strength'] == 'strong']
@@ -897,11 +1294,18 @@ def main():
             print(f"  {signal_type}: {count}个")
 
         # 按颈线突破情况分类
-        breakout_signals = [s for s in buy_signals if s['neckline_info']['is_neckline_breakout']]
-        non_breakout_signals = [s for s in buy_signals if not s['neckline_info']['is_neckline_breakout']]
+        breakout_signals = [s for s in buy_signals if s['neckline_info']['breakout_strength'] != '未突破']
+        non_breakout_signals = [s for s in buy_signals if s['neckline_info']['breakout_strength'] == '未突破']
 
         print(f"颈线突破信号数量: {len(breakout_signals)}")
         print(f"颈线未突破信号数量: {len(non_breakout_signals)}")
+
+        # 按时效性分类
+        active_signals = [s for s in buy_signals if s['opportunity_info']['remaining_validity_days'] > 0]
+        expired_signals = [s for s in buy_signals if s['opportunity_info']['remaining_validity_days'] <= 0]
+
+        print(f"有效期内信号数量: {len(active_signals)}")
+        print(f"已过期信号数量: {len(expired_signals)}")
 
         # 创建输出目录
         output_dir = Path.home() / "Downloads" / "CoreNews_Reports"
@@ -917,10 +1321,12 @@ def main():
         for signal in buy_signals:
             neckline_info = signal['neckline_info']
             price_status = signal['price_relative_status']
+            opportunity_info = signal['opportunity_info']
 
             row = {
                 '股票代码': signal['symbol'],
                 '股票简称': signal['stock_name'],
+                '买卖建议': signal['trade_recommendation'],
                 '信号日期': signal['signal_date'],
                 '谷1日期': signal['pattern_valley1_date'],
                 '谷2日期': signal['pattern_valley2_date'],
@@ -932,7 +1338,6 @@ def main():
                 'KDJ信号': signal['kdj_signal'],
                 'KDJ信号日期': signal['kdj_signal_date'],
                 '颈线价格': neckline_info['neckline_price'],
-                '颈线突破状态': neckline_info['neckline_status'],
                 '颈线突破差值': neckline_info['neck_diff'],
                 '颈线突破强度': neckline_info['breakout_strength'],
                 '价格相对状态': price_status['status_description'],
@@ -940,15 +1345,44 @@ def main():
                 '距离谷1价格': price_status['distance_to_valley1'],
                 '距离谷2价格': price_status['distance_to_valley2'],
                 '谷1价格': price_status['valley1_price'],
-                '谷2价格': price_status['valley2_price']
+                '谷2价格': price_status['valley2_price'],
+                '高位死叉信号数': signal['sell_signals_count'],
+                '风险等级': signal['risk_level'],
+                '风险警示': '是' if signal['has_risk_warning'] else '否',
+                # --- 新增：导出量能字段 ---
+                '量能评分': signal['volume_score'],
+                '底部缩量': '是' if signal['is_valley_shrink'] else '否',
+                '突破放量': '是' if signal['is_breakout_amplify'] else '否',
+                # --- 新增：导出时效性字段 ---
+                '信号年龄(天)': opportunity_info['days_since_signal'],
+                '信号年龄类别': opportunity_info['signal_age_category'],
+                '调整后有效期(天)': opportunity_info['adjusted_validity_days'],
+                '剩余有效期(天)': opportunity_info['remaining_validity_days'],
+                '机会得分': opportunity_info['opportunity_score'],
+                '操作紧迫性': opportunity_info['urgency_level'],
+                '信号有效期至': opportunity_info['valid_until'].strftime('%Y-%m-%d')
+                # ---
             }
             export_data.append(row)
 
         # 创建DataFrame并导出
         df_export = pd.DataFrame(export_data)
 
-        # 按颈线突破差值排序（优先显示突破幅度大的）
-        df_export = df_export.sort_values(by=['颈线突破差值'], ascending=False)
+        # 按买卖建议和风险等级排序（优先显示强烈买入且低风险的）
+        recommendation_order = {
+            '强烈买入': 0,
+            '买入': 1,
+            '潜在买入': 2,
+            '谨慎买入': 3,
+            '轻仓试探': 4,
+            '观望': 5,
+            '量能不足-观望': 6,
+            '量能一般-谨慎': 7
+        }
+        df_export['recommendation_order'] = df_export['买卖建议'].map(recommendation_order)
+        df_export = df_export.sort_values(by=['recommendation_order', '风险等级', '量能评分', '机会得分'],
+                                          key=lambda x: x.map({'低': 0, '高': 1}) if x.name == '风险等级' else x,
+                                          ascending=[True, True, False, False])
 
         # 导出到Excel
         with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
@@ -972,8 +1406,92 @@ def main():
 
         print(f"\n买入信号已导出到: {filepath}")
         print(f"导出记录数: {len(buy_signals)}")
+
+        # 生成风险报告
+        if risk_signals:
+            risk_filename = f"MACD_KDJ_Risk_Signals_{timestamp}.xlsx"
+            risk_filepath = output_dir / risk_filename
+
+            risk_export_data = []
+            for signal in risk_signals:
+                neckline_info = signal['neckline_info']
+                price_status = signal['price_relative_status']
+                opportunity_info = signal['opportunity_info']
+
+                row = {
+                    '股票代码': signal['symbol'],
+                    '股票简称': signal['stock_name'],
+                    '买卖建议': signal['trade_recommendation'],
+                    '信号日期': signal['signal_date'],
+                    '谷1日期': signal['pattern_valley1_date'],
+                    '谷2日期': signal['pattern_valley2_date'],
+                    'MA60方向': signal['ma60_direction'],
+                    '信号强度': signal['signal_strength'],
+                    '当前MA60斜率': signal['current_ma60_slope'],
+                    '当前BAR值': signal['current_bar_value'],
+                    '当前价格': signal['current_price'],
+                    'KDJ信号': signal['kdj_signal'],
+                    'KDJ信号日期': signal['kdj_signal_date'],
+                    '颈线价格': neckline_info['neckline_price'],
+                    '颈线突破差值': neckline_info['neck_diff'],
+                    '颈线突破强度': neckline_info['breakout_strength'],
+                    '价格相对状态': price_status['status_description'],
+                    '价格恢复度(%)': price_status['price_recovery_rate'],
+                    '距离谷1价格': price_status['distance_to_valley1'],
+                    '距离谷2价格': price_status['distance_to_valley2'],
+                    '谷1价格': price_status['valley1_price'],
+                    '谷2价格': price_status['valley2_price'],
+                    '高位死叉信号数': signal['sell_signals_count'],
+                    '风险等级': signal['risk_level'],
+                    '风险警示': '是',
+                    # --- 新增：导出量能字段 ---
+                    '量能评分': signal['volume_score'],
+                    '底部缩量': '是' if signal['is_valley_shrink'] else '否',
+                    '突破放量': '是' if signal['is_breakout_amplify'] else '否',
+                    # --- 新增：导出时效性字段 ---
+                    '信号年龄(天)': opportunity_info['days_since_signal'],
+                    '信号年龄类别': opportunity_info['signal_age_category'],
+                    '调整后有效期(天)': opportunity_info['adjusted_validity_days'],
+                    '剩余有效期(天)': opportunity_info['remaining_validity_days'],
+                    '机会得分': opportunity_info['opportunity_score'],
+                    '操作紧迫性': opportunity_info['urgency_level'],
+                    '信号有效期至': opportunity_info['valid_until'].strftime('%Y-%m-%d')
+                    # ---
+                }
+                risk_export_data.append(row)
+
+            df_risk_export = pd.DataFrame(risk_export_data)
+            df_risk_export['recommendation_order'] = df_risk_export['买卖建议'].map(recommendation_order)
+            df_risk_export = df_risk_export.sort_values(
+                by=['高位死叉信号数', 'recommendation_order', '量能评分', '机会得分'],
+                ascending=[False, True, False, False])
+
+            # 导出风险信号到Excel
+            with pd.ExcelWriter(risk_filepath, engine='openpyxl') as writer:
+                df_risk_export.to_excel(writer, sheet_name='风险信号', index=False)
+
+                # 获取工作表对象以进行格式设置
+                worksheet = writer.sheets['风险信号']
+
+                # 自动调整列宽
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)  # 限制最大宽度
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+
+            print(f"风险信号已导出到: {risk_filepath}")
+            print(f"风险信号记录数: {len(risk_signals)}")
     else:
         print("\n未发现符合条件的买入信号")
+
+    print("\n分析完成!")
 
 
 if __name__ == "__main__":

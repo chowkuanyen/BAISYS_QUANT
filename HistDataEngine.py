@@ -223,7 +223,7 @@ class StockSyncEngine:
         # 过滤
         report_df['机构投资评级(近六个月)-买入'] = pd.to_numeric(report_df['机构投资评级(近六个月)-买入'],
                                                                  errors='coerce').fillna(0)
-        qualified = report_df[report_df['机构投资评级(近六个月)-买入'] > 1]['股票代码'].unique()
+        qualified = report_df[report_df['机构投资评级(近六个月)-买入'] > 0]['股票代码'].unique()
 
         result = set(qualified)
         print(f"[INFO] 过滤后剩余 {len(result)} 只符合条件的股票。")
@@ -247,7 +247,7 @@ class StockSyncEngine:
             if df_qfq.empty:
                 return None
 
-            expected_cols = ['date', 'open', 'close', 'high', 'low']
+            expected_cols = ['date', 'open', 'close', 'high', 'low', 'amount']
             missing = [c for c in expected_cols if c not in df_qfq.columns]
             if missing:
                 print(f"[ERROR] QFQ 数据缺失列: {missing}")
@@ -258,7 +258,8 @@ class StockSyncEngine:
             if df_norm.empty:
                 return None
 
-            df_norm = df_norm[['date', 'close']].rename(columns={'close': 'close_normal'})
+            df_norm = df_norm[['date', 'close', 'amount']].rename(
+                columns={'close': 'close_normal', 'amount': 'volume_normal'})
             df = pd.merge(df_qfq, df_norm, on='date', how='inner')
             if df.empty:
                 return None
@@ -266,6 +267,13 @@ class StockSyncEngine:
             df['close'] = pd.to_numeric(df['close'])
             df['close_normal'] = pd.to_numeric(df['close_normal'])
             df['adj_ratio'] = df['close'] / df['close_normal'].replace(0, pd.NA)
+
+            # 计算复权成交量
+            df['amount'] = pd.to_numeric(df['amount'])
+            df['volume_normal'] = pd.to_numeric(df['volume_normal'])
+            df['volume_adj_ratio'] = df['amount'] / df['volume_normal'].replace(0, pd.NA)
+            df['volume'] = df['volume_normal'] * df['volume_adj_ratio']
+
             df.dropna(subset=['adj_ratio'], inplace=True)
 
             df['symbol'] = format_stock_code(symbol)
@@ -273,8 +281,8 @@ class StockSyncEngine:
             df.rename(columns={'date': 'trade_date'}, inplace=True)
 
             final_cols = [
-                'trade_date', 'symbol', 'open', 'close', 'high', 'low',
-                'close_normal', 'adj_ratio'
+                'trade_date', 'symbol', 'open', 'close', 'high', 'low', 'amount',
+                'close_normal', 'volume', 'adj_ratio'
             ]
             return df[final_cols]
         except Exception as e:
@@ -338,7 +346,8 @@ class StockSyncEngine:
             try:
                 df = pd.read_csv(self.kline_cache_path, sep='|', encoding='utf-8-sig')
                 # 确保字段存在
-                expected_cols = ['trade_date', 'symbol', 'open', 'close', 'high', 'low', 'close_normal', 'adj_ratio']
+                expected_cols = ['trade_date', 'symbol', 'open', 'close', 'high', 'low', 'amount', 'close_normal',
+                                 'volume', 'adj_ratio']
                 missing = [c for c in expected_cols if c not in df.columns]
                 if missing:
                     print(f"[WARN] 缓存缺少列: {missing}，将重取")

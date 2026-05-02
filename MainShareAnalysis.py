@@ -622,7 +622,7 @@ class StockAnalyzer:
         final_df = pd.merge(final_df, all_names, on='股票代码', how='left')
 
         if '股票简称' not in spot_df.columns:
-            self.logger.critical("[FATAL] 实时行情数据中缺少 '股票简称' 列，无法按要求按简称关联。回退到按代码关联。")
+
             price_source_key = '股票代码'
             price_source = spot_df[['股票代码', '最新价']].copy()
         else:
