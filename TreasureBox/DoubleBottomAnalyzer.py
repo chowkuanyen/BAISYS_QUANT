@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 import warnings
 import os
+import pandas_ta as ta #勿删
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -12,7 +13,11 @@ from tqdm import tqdm
 import time
 import logging
 import configparser
-from KDJAnalyzer import calculate_kdj_signal_from_df
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
 
 warnings.filterwarnings('ignore')
 
@@ -106,6 +111,71 @@ def calculate_kdj_from_df(df: pd.DataFrame) -> pd.DataFrame:
     df['J'] = df['J'].clip(-50, 150)  # J值可以稍微超出0-100范围
 
     return df
+
+
+def calculate_kdj_signal_from_df(df: pd.DataFrame) -> str:
+    """
+    根据单只股票的DataFrame计算严格的KDJ信号。
+    此函数逻辑与 SignalManager.py 中的KDJ信号逻辑完全一致。
+
+    Args:
+        df: 包含 'close', 'high', 'low' 列的股票历史数据DataFrame
+
+    Returns:
+        str: KDJ信号描述字符串，如 "极值J线反转 (K=15.2, J=-2.1)"。若无信号则返回空字符串 ""。
+    """
+    if len(df) < 10:
+        return ""
+
+    # 使用 pandas_ta 计算KDJ
+    df = df.copy()  # 避免修改原DataFrame
+    df.ta.stoch(append=True, close='close', high='high', low='low')
+    kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
+    if len(kdj_cols) < 2:
+        return ""
+
+    k_col = kdj_cols[0]
+    d_col = kdj_cols[1]
+    j_col = 'KDJ_J'
+    df[j_col] = 3 * df[k_col] - 2 * df[d_col]
+
+    # 检查最新的金叉
+    kdj_cross = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1))
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+
+    # 条件1: 极值J线反转
+    if prev_row[j_col] < 0 and last_row[j_col] > 5 and kdj_cross.iloc[-1]:
+        return f"极值J线反转 (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
+
+    # 条件2: 底背离金叉
+    window = 10
+    curr_low = df['low'].iloc[-1]
+    curr_k = df[k_col].iloc[-1]
+    min_k_window = df[k_col].iloc[-window:-1].min()
+    min_low_window = df['low'].iloc[-window:-1].min()
+    is_divergence = (curr_low <= min_low_window * 1.02) & (curr_k > min_k_window * 1.1)
+    if kdj_cross.iloc[-1] and is_divergence and last_row[k_col] < 30:
+        return f"底背离金叉 (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
+
+    # 计算5日均线用于后续条件
+    ma5 = df['close'].rolling(window=5).mean()
+    above_ma5 = df['close'] > ma5
+
+    # 检查过去5天是否有超卖
+    kd_oversold = (df[k_col] < 20) & (df[d_col] < 20)
+    had_oversold = kd_oversold.iloc[-5:-1].any()
+
+    # 条件3: 趋势确认金叉
+    if had_oversold and kdj_cross.iloc[-1] and above_ma5.iloc[-1]:
+        return f"趋势确认金叉 (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
+
+    # 条件4: 低位超卖金叉
+    if had_oversold and kdj_cross.iloc[-1]:
+        return f"低位超卖金叉 (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
+
+    # 如果以上条件都不满足，则无信号
+    return ""
 
 
 class StockOpportunityAnalyzer:
@@ -466,7 +536,6 @@ class MACDKDJDoubleBottomAnalyzer:
 
         return local_minima, local_maxima
 
-
     def analyze_volume(self, df: pd.DataFrame, valley1_idx: int, valley2_idx: int, convergence_idx: int) -> Dict:
         """
         分析双底形态的量能情况，验证真实性
@@ -517,7 +586,6 @@ class MACDKDJDoubleBottomAnalyzer:
         volume_analysis['volume_score'] = min(volume_analysis['volume_score'], 100)
 
         return volume_analysis
-
 
     def calculate_neckline(self, df: pd.DataFrame, valley1_idx: int, valley2_idx: int, peak_between_idx: int) -> Dict:
         """
@@ -838,7 +906,6 @@ class MACDKDJDoubleBottomAnalyzer:
                     sell_signals_count
                 )
 
-
                 pattern_info = {
                     'valley1_date': df.iloc[valley1_idx]['trade_date'].date(),
                     'valley1_value': valley1_val,
@@ -991,6 +1058,112 @@ class MACDKDJDoubleBottomAnalyzer:
             }
 
 
+def export_results_to_excel(results, buy_signals, config):
+    """
+    将分析结果导出到Excel文件
+    """
+    # 创建工作簿
+    wb = Workbook()
+
+    # 删除默认工作表
+    ws_main = wb.active
+    ws_main.title = "双谷形态分析结果"
+
+    # 添加表头
+    headers = [
+        "股票简称", "买卖建议", "信号日期", "谷1日期", "谷2日期",
+        "MA60方向", "信号强度", "当前MA60斜率", "当前BAR值", "当前价格",
+        "KDJ信号", "KDJ信号日期", "颈线价格", "颈线突破差值", "颈线突破强度",
+        "距离谷1价格", "距离谷2价格", "谷1价格", "谷2价格",
+        "量能评分", "底部缩量", "突破放量",
+        "信号年龄(天)", "剩余有效期(天)", "机会得分"
+    ]
+
+    ws_main.append(headers)
+
+    # 添加数据
+    for signal in buy_signals:
+        neckline_info = signal['neckline_info']
+        price_status = signal['price_relative_status']
+        opportunity_info = signal['opportunity_info']
+
+        row_data = [
+            signal['stock_name'],
+            signal['trade_recommendation'],
+            signal['signal_date'],
+            signal['pattern_valley1_date'],
+            signal['pattern_valley2_date'],
+            signal['ma60_direction'],
+            signal['signal_strength'],
+            signal['current_ma60_slope'],
+            signal['current_bar_value'],
+            signal['current_price'],
+            signal['kdj_signal'],
+            signal['kdj_signal_date'],
+            neckline_info['neckline_price'],
+            neckline_info['neck_diff'],
+            neckline_info['breakout_strength'],
+            price_status['distance_to_valley1'],
+            price_status['distance_to_valley2'],
+            price_status['valley1_price'],
+            price_status['valley2_price'],
+            signal['volume_score'],
+            '是' if signal['is_valley_shrink'] else '否',
+            '是' if signal['is_breakout_amplify'] else '否',
+            opportunity_info['days_since_signal'],
+            opportunity_info['remaining_validity_days'],
+            opportunity_info['opportunity_score']
+        ]
+
+        ws_main.append(row_data)
+
+    # 设置标题样式
+    header_font = Font(size=12, bold=True)
+    header_fill = PatternFill(start_color="E6E6FA", end_color="E6E6FA", fill_type="solid")
+    thin_border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+
+    # 格式化表头
+    for col_num, header in enumerate(headers, 1):
+        cell = ws_main.cell(row=1, column=col_num)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # 自动调整列宽
+    for column in ws_main.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+
+        adjusted_width = min(max_length + 2, 50)
+        ws_main.column_dimensions[column_letter].width = adjusted_width
+
+    # 格式化数据行
+    for row in ws_main.iter_rows(min_row=2, max_row=len(buy_signals) + 1, min_col=1, max_col=len(headers)):
+        for cell in row:
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal='left', vertical='center')
+
+    # 保存文件
+    current_time = datetime.now().strftime("%Y%m%d%H%M")
+    filename = f"双谷探底机会点_{current_time}.xlsx"
+    filepath = os.path.join(config.HOME_DIRECTORY, filename)
+    wb.save(filepath)
+    print(f"分析结果已保存到: {filepath}")
+
+
 def main():
     """
     主函数 - 全市场扫描MACD+KDJ双重谷形态（多线程版本，含时效性分析）
@@ -1056,7 +1229,6 @@ def main():
     print(f"\n=== 分析结果汇总 ===")
     print(f"总股票数: {total_stocks}")
     print(f"有效股票数: {valid_stocks}")
-    print(f"发现双谷形态的股票数: {stocks_with_patterns}")
 
     # 生成买入信号
     buy_signals = []
@@ -1122,13 +1294,6 @@ def main():
     if buy_signals:
         print(f"\n=== 买入信号详情 ===")
 
-        # 按风险等级分组
-        high_risk_signals = [s for s in buy_signals if s['risk_level'] == '高']
-        low_risk_signals = [s for s in buy_signals if s['risk_level'] == '低']
-
-        print(f"高风险信号数量: {len(high_risk_signals)}")
-        print(f"低风险信号数量: {len(low_risk_signals)}")
-
         # 按买卖建议分组
         recommendation_groups = {}
         for signal in buy_signals:
@@ -1155,49 +1320,14 @@ def main():
             print(f"  KDJ信号日期: {signal['kdj_signal_date']}")
             print(f"  颈线价格: {neckline_info['neckline_price']}")
             print(f"  颈线突破差值: {neckline_info['neck_diff']}")
-            print(f"  颈线突破强度: {neckline_info['breakout_strength']}")
             print(f"  价格状态: {price_status['status_description']}")
             print(f"  风险等级: {signal['risk_level']}")
             print(f"  量能评分: {signal['volume_score']}")
             print(f"  底部缩量: {'是' if signal['is_valley_shrink'] else '否'}")
             print(f"  突破放量: {'是' if signal['is_breakout_amplify'] else '否'}")
 
-        # 按信号强度分类
-        strong_signals = [s for s in buy_signals if s['signal_strength'] == 'strong']
-        weak_signals = [s for s in buy_signals if s['signal_strength'] == 'weak']
-
-        print(f"\n强买入信号数量: {len(strong_signals)}")
-        print(f"弱买入信号数量: {len(weak_signals)}")
-
-        # 按KDJ信号类型统计
-        signal_types = {}
-        for s in buy_signals:
-            signal_type = s['kdj_signal']
-            if signal_type in signal_types:
-                signal_types[signal_type] += 1
-            else:
-                signal_types[signal_type] = 1
-
-        print(f"\nKDJ信号类型分布:")
-        for signal_type, count in signal_types.items():
-            print(f"  {signal_type}: {count}个")
-
-        # 按颈线突破情况分类
-        breakout_signals = [s for s in buy_signals if s['neckline_info']['breakout_strength'] != '未突破']
-        non_breakout_signals = [s for s in buy_signals if s['neckline_info']['breakout_strength'] == '未突破']
-
-        print(f"颈线突破信号数量: {len(breakout_signals)}")
-        print(f"颈线未突破信号数量: {len(non_breakout_signals)}")
-
-        # 按时效性分类
-        active_signals = [s for s in buy_signals if s['opportunity_info']['remaining_validity_days'] > 0]
-        expired_signals = [s for s in buy_signals if s['opportunity_info']['remaining_validity_days'] <= 0]
-
-        print(f"有效期内信号数量: {len(active_signals)}")
-        print(f"已过期信号数量: {len(expired_signals)}")
-    else:
-        print("\n未发现符合条件的买入信号")
-
+    # 导出结果到Excel
+    export_results_to_excel(results, buy_signals, config)
     print("\n分析完成!")
 
 if __name__ == "__main__":

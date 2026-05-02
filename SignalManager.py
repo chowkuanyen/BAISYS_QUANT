@@ -2,11 +2,14 @@ import pandas as pd
 from typing import List, Dict
 from MACDAnalyzer import MACDAnalyzer
 from FormatManager.ShareCodeFormatMgr import format_stock_code
+from KDJAnalyzer import AdvancedKDJAnalyzer
+
 class TASignalProcessor:
     """技术指标信号处理类"""
 
     def __init__(self, analyzer_instance):
         self.analyzer = analyzer_instance
+        self.kdj_analyzer = AdvancedKDJAnalyzer()
 
     def _classify_cci_level(self, cci_value: float) -> str:
         """根据CCI值分类"""
@@ -57,7 +60,6 @@ class TASignalProcessor:
         hist_df_all = hist_df_all[hist_df_all['股票代码'].isin(code_set)].copy()
 
         for code in all_codes:
-            # 2. 提取纯数字代码用于单只股票的精确匹配
             pure_code = code[2:] if str(code).startswith(('sh', 'sz', 'bj')) else code
             df = hist_df_all[hist_df_all['股票代码'] == pure_code].copy()
 
@@ -112,50 +114,16 @@ class TASignalProcessor:
                     pd.DataFrame([{'股票代码': code, 'MACD_6135_Signal': signal_detail}])
                 ], ignore_index=True)
 
-            # KDJ
-            df.ta.stoch(append=True, close='close', high='high', low='low')
-            kdj_cols = [col for col in df.columns if col.startswith('STOCHk_') or col.startswith('STOCHd_')]
-            if len(kdj_cols) >= 2:
-                k_col = kdj_cols[0]
-                d_col = kdj_cols[1]
-                j_col = 'KDJ_J'
-                df[j_col] = 3 * df[k_col] - 2 * df[d_col]
-
-                kdj_cross = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1))
-                j_oversold = df[j_col].shift(1).rolling(window=3).min() < 0
-                kd_oversold = (df[k_col] < 20) & (df[d_col] < 20)
-
-                window = 10
-                curr_low = df['low'].iloc[-1]
-                curr_k = df[k_col].iloc[-1]
-                min_k_window = df[k_col].iloc[-window:-1].min()
-                min_low_window = df['low'].iloc[-window:-1].min()
-                is_divergence = (curr_low <= min_low_window * 1.02) & (curr_k > min_k_window * 1.1)
-
-                ma5 = df['close'].rolling(window=5).mean()
-                above_ma5 = df['close'] > ma5
-
-                last_row = df.iloc[-1]
-                prev_row = df.iloc[-2]
-
-                signal_msg = ""
-                if prev_row[j_col] < 0 and last_row[j_col] > 5 and kdj_cross.iloc[-1]:
-                    signal_msg = "极值J线反转"
-                elif kdj_cross.iloc[-1] and is_divergence and last_row[k_col] < 30:
-                    signal_msg = "底背离金叉"
-                elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1] and above_ma5.iloc[-1]:
-                    signal_msg = "趋势确认金叉"
-                elif (kd_oversold.iloc[-5:-1].sum() > 0) and kdj_cross.iloc[-1]:
-                    signal_msg = "低位超卖金叉"
-
-                if signal_msg:
-                    ta_signals['KDJ'] = pd.concat([
-                        ta_signals['KDJ'],
-                        pd.DataFrame([{
-                            '股票代码': code,
-                            'KDJ_Signal': f"{signal_msg} (K={last_row[k_col]:.1f}, J={last_row[j_col]:.1f})"
-                        }])
-                    ], ignore_index=True)
+            # KDJ - 现在通过AdvancedKDJAnalyzer计算
+            kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
+            if kdj_signal:
+                ta_signals['KDJ'] = pd.concat([
+                    ta_signals['KDJ'],
+                    pd.DataFrame([{
+                        '股票代码': code,
+                        'KDJ_Signal': kdj_signal
+                    }])
+                ], ignore_index=True)
 
             # CCI
             df.ta.cci(append=True, close='close', high='high', low='low')
