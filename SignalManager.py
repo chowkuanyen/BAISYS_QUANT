@@ -1,8 +1,6 @@
 import pandas as pd
 from typing import List, Dict
-
-import ta
-
+import pandas_ta as ta  # 勿删
 from MACDAnalyzer import MACDAnalyzer
 from FormatManager.ShareCodeFormatMgr import format_stock_code
 from KDJAnalyzer import AdvancedKDJAnalyzer
@@ -13,6 +11,7 @@ class TASignalProcessor:
     def __init__(self, analyzer_instance):
         self.analyzer = analyzer_instance
         self.kdj_analyzer = AdvancedKDJAnalyzer()
+        self.macd_analyzer = MACDAnalyzer()
 
     def _classify_cci_level(self, cci_value: float) -> str:
         """根据CCI值分类"""
@@ -33,6 +32,7 @@ class TASignalProcessor:
         ta_signals = {
             'MACD_12269': pd.DataFrame(columns=['股票代码', 'MACD_12269_Signal']),
             'MACD_6135': pd.DataFrame(columns=['股票代码', 'MACD_6135_Signal']),
+            'MACD_COMBINED_DIVERGENCE': pd.DataFrame(columns=['股票代码', 'Combined_Divergence_Signal']), # 新增
             'KDJ': pd.DataFrame(columns=['股票代码', 'KDJ_Signal']),
             'CCI': pd.DataFrame(columns=['股票代码', 'CCI_Signal']),
             'RSI': pd.DataFrame(columns=['股票代码', 'RSI_Signal']),
@@ -80,7 +80,20 @@ class TASignalProcessor:
                 print(f"[ERROR] 股票 {code}: 缺少必要的 OHLC 列，跳过。")
                 continue
 
-            df = MACDAnalyzer._custom_macd(self, df)
+            df = self.macd_analyzer._custom_macd(df)
+
+         
+            combined_div_signals = MACDAnalyzer.detect_combined_divergence(df)
+            divergence_signal = combined_div_signals.get('combined_signal', '')
+            if divergence_signal: # 只有当有信号时才添加
+                ta_signals['MACD_COMBINED_DIVERGENCE'] = pd.concat([
+                    ta_signals['MACD_COMBINED_DIVERGENCE'],
+                    pd.DataFrame([{
+                        '股票代码': code,
+                        'Combined_Divergence_Signal': divergence_signal
+                    }])
+                ], ignore_index=True)
+            # --- 结束新增 ---
 
             try:
                 latest_row = df.iloc[-1]

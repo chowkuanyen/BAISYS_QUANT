@@ -767,6 +767,13 @@ class StockAnalyzer:
             ta_dfs_to_merge.append(macd_df_fast[['股票代码', 'MACD_6135_Signal']].rename(
                 columns={'MACD_6135_Signal': 'MACD_6135'}))
 
+        # --- 新增：处理组合背离信号 ---
+        macd_div_df = processed_data.get('MACD_COMBINED_DIVERGENCE', pd.DataFrame())
+        if not macd_div_df.empty:
+            ta_dfs_to_merge.append(macd_div_df[['股票代码', 'Combined_Divergence_Signal']].rename(
+                columns={'Combined_Divergence_Signal': 'MACD_组合背离'}))
+        # --- 结束新增 ---
+
         kdj_df = processed_data.get('KDJ', pd.DataFrame())
         if not kdj_df.empty:
             ta_dfs_to_merge.append(kdj_df[['股票代码', 'KDJ_Signal']].rename(
@@ -798,7 +805,7 @@ class StockAnalyzer:
                 if col in final_df.columns:
                     final_df[col] = final_df[col].fillna('')
 
-        for col in ['MACD_12269', 'MACD_6135', 'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal']:
+        for col in ['MACD_12269', 'MACD_6135', 'MACD_组合背离', 'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal']: # 更新列名列表
             if col in final_df.columns:
                 final_df[col] = final_df[col].fillna('')
             else:
@@ -860,6 +867,7 @@ class StockAnalyzer:
                     row.get('TOP10行业') == '是' or
                     row['MACD_12269'] != '' or
                     row['MACD_6135'] != '' or
+                    row['MACD_组合背离'] != '' or # 检查新增的背离信号
                     row['KDJ_Signal'] != '' or
                     row['CCI_Signal'] != '' or
                     row['RSI_Signal'] != '' or
@@ -885,6 +893,7 @@ class StockAnalyzer:
             '强势股', '量价齐升', '连涨天数', '放量天数', 'TOP10行业',
             'MACD_12269', 'MACD_12269_动能', 'MACD_12269_DIF',
             'MACD_6135', 'MACD_6135_动能', 'MACD_6135_DIF',
+            'MACD_组合背离', # 将新列添加到信号列中
             'KDJ_Signal', 'CCI_Signal', 'RSI_Signal', 'BOLL_Signal',
         ]
         report_cols = [
@@ -896,6 +905,7 @@ class StockAnalyzer:
         final_df = final_df[[col for col in final_cols if col in final_df.columns]]
 
         return final_df
+
 
     def _merge_industry_signal_to_stocks(self, stock_df: pd.DataFrame, industry_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1183,6 +1193,7 @@ class StockAnalyzer:
                 '持续放量': raw_data['cxfl_raw'],
                 'MACD_12269金叉': ta_signals.get('MACD_12269', pd.DataFrame()),
                 'MACD_6135金叉': ta_signals.get('MACD_6135', pd.DataFrame()),
+                'MACD_组合背离': ta_signals.get('MACD_COMBINED_DIVERGENCE', pd.DataFrame()),
                 'MACD_DIF_动能状态': ta_signals.get('MACD_DIF_MOMENTUM', pd.DataFrame()),
                 'KDJ超卖金叉': ta_signals.get('KDJ', pd.DataFrame()),
                 'CCI专业状态': ta_signals.get('CCI', pd.DataFrame()),
