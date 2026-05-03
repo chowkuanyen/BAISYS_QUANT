@@ -1,5 +1,8 @@
 import pandas as pd
 from typing import List, Dict
+
+import ta
+
 from MACDAnalyzer import MACDAnalyzer
 from FormatManager.ShareCodeFormatMgr import format_stock_code
 from KDJAnalyzer import AdvancedKDJAnalyzer
@@ -141,6 +144,8 @@ class TASignalProcessor:
 
             # RSI
             df.ta.rsi(append=True, close='close', length=14)
+
+
             rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
             if rsi_cols:
                 rsi_col = rsi_cols[0]
