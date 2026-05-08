@@ -1158,6 +1158,12 @@ class StockAnalyzer:
                 kdj_is_empty = kdj_col.isna() | (kdj_col.astype(str).str.strip().str.lower().isin(['', 'nan', 'none']))
 
                 # 定义剔除条件（所有条件需同时满足）
+                # 新增：完全多头评分 >= 60 的股票豁免剔除（避免误伤）
+                full_bull_score = pd.to_numeric(
+                    consolidated_report.get('FullBull_Score', pd.Series(dtype=float)),
+                    errors='coerce'
+                ).fillna(0)
+
                 drop_condition = (
                         (consolidated_report.get('强势股') == '否') &
                         (consolidated_report.get('量价齐升') == '否') &
@@ -1169,7 +1175,8 @@ class StockAnalyzer:
                         (dif_6135 < 0) &
                         kdj_is_empty &
                         (consolidated_report.get('5日资金流入', pd.Series(dtype=str)).astype(str).str.contains('-',
-                                                                                                               na=False))
+                                                                                                               na=False)) &
+                        (full_bull_score < 60)   # 豁免：完全多头评分达标的股票不被剔除
                 )
 
                 initial_count = len(consolidated_report)
@@ -1194,6 +1201,7 @@ class StockAnalyzer:
                 'MACD_12269金叉': ta_signals.get('MACD_12269', pd.DataFrame()),
                 'MACD_6135金叉': ta_signals.get('MACD_6135', pd.DataFrame()),
                 'MACD_组合背离': ta_signals.get('MACD_COMBINED_DIVERGENCE', pd.DataFrame()),
+                'MACD_完全多头评分': ta_signals.get('MACD_FULL_BULL', pd.DataFrame()),   # 新增
                 'MACD_DIF_动能状态': ta_signals.get('MACD_DIF_MOMENTUM', pd.DataFrame()),
                 'KDJ超卖金叉': ta_signals.get('KDJ', pd.DataFrame()),
                 'CCI专业状态': ta_signals.get('CCI', pd.DataFrame()),
